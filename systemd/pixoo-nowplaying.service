@@ -1,0 +1,11 @@
+[Unit]
+Description=Now-playing artwork on Divoom Pixoo 64
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.cargo/bin/pixoo-nowplaying
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
