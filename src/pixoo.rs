@@ -59,7 +59,7 @@ impl Client {
         }
     }
 
-    fn post(&self, payload: &Value) -> Result<()> {
+    fn post(&self, payload: &Value) -> Result<Value> {
         let body: Value = self
             .agent
             .post(&self.endpoint)
@@ -68,19 +68,32 @@ impl Client {
             .into_json()
             .context("Pixoo returned non-JSON response")?;
         match body.get("error_code").and_then(Value::as_i64) {
-            Some(0) => Ok(()),
+            Some(0) => Ok(body),
             code => bail!("Pixoo rejected {}: error_code={code:?}", payload["Command"]),
         }
     }
 
+    /// Best-effort: the reported SelectIndex does not always track what is
+    /// actually displayed (see restore bounce), but it is the only way to
+    /// learn which channel the user had selected.
+    pub fn get_index(&self) -> Result<u8> {
+        let body = self.post(&json!({ "Command": "Channel/GetIndex" }))?;
+        body.get("SelectIndex")
+            .and_then(Value::as_u64)
+            .and_then(|i| u8::try_from(i).ok())
+            .context("Channel/GetIndex returned no usable SelectIndex")
+    }
+
     pub fn show_frame(&self, rgb: &[u8]) -> Result<()> {
         self.post(&reset_gif_payload())?;
-        self.post(&frame_payload(rgb)?)
+        self.post(&frame_payload(rgb)?)?;
+        Ok(())
     }
 
     pub fn restore_channel(&self, index: u8) -> Result<()> {
         self.post(&set_channel_payload(bounce_index(index)))?;
-        self.post(&set_channel_payload(index))
+        self.post(&set_channel_payload(index))?;
+        Ok(())
     }
 }
 

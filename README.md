@@ -25,8 +25,9 @@ EOF
 Optional config keys (defaults shown):
 
 ```toml
-restore_channel = 1     # Channel/SetIndex target when playback stops
 idle_restore_secs = 30  # how long playback must be stopped before restoring
+# restore_channel = 1   # unset: restore to whatever channel was showing
+                        # when artwork took over (Channel/GetIndex)
 ```
 
 ## Run

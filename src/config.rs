@@ -3,20 +3,17 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-const DEFAULT_RESTORE_CHANNEL: u8 = 1;
 const DEFAULT_IDLE_RESTORE_SECS: u64 = 30;
 
 #[derive(Debug, Deserialize, PartialEq)]
 pub struct Config {
     pub pixoo_ip: String,
-    #[serde(default = "default_restore_channel")]
-    pub restore_channel: u8,
+    /// When unset, the daemon restores to whatever channel the device
+    /// reported just before artwork took the screen over.
+    #[serde(default)]
+    pub restore_channel: Option<u8>,
     #[serde(default = "default_idle_restore_secs")]
     pub idle_restore_secs: u64,
-}
-
-fn default_restore_channel() -> u8 {
-    DEFAULT_RESTORE_CHANNEL
 }
 
 fn default_idle_restore_secs() -> u64 {
@@ -50,7 +47,7 @@ mod tests {
     fn parses_minimal_config_with_defaults() {
         let c = parse(r#"pixoo_ip = "192.168.0.153""#).unwrap();
         assert_eq!(c.pixoo_ip, "192.168.0.153");
-        assert_eq!(c.restore_channel, 1);
+        assert_eq!(c.restore_channel, None);
         assert_eq!(c.idle_restore_secs, 30);
     }
 
@@ -64,7 +61,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!(c.restore_channel, 0);
+        assert_eq!(c.restore_channel, Some(0));
         assert_eq!(c.idle_restore_secs, 60);
     }
 

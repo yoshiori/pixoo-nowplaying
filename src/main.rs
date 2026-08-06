@@ -17,10 +17,33 @@ const PLAYERCTL_FORMAT: &str = "{{status}}\t{{mpris:artUrl}}";
 const RESPAWN_DELAY: Duration = Duration::from_secs(2);
 const TICK_INTERVAL: Duration = Duration::from_secs(1);
 
+const FALLBACK_CHANNEL: u8 = 1;
+
+/// Which channel to hand the screen back to. A configured value always wins;
+/// otherwise the channel the device reported when artwork took over.
+struct RestoreTarget {
+    configured: Option<u8>,
+    captured: u8,
+}
+
+impl RestoreTarget {
+    fn new(configured: Option<u8>) -> Self {
+        Self {
+            configured,
+            captured: FALLBACK_CHANNEL,
+        }
+    }
+
+    fn current(&self) -> u8 {
+        self.configured.unwrap_or(self.captured)
+    }
+}
+
 fn main() -> Result<()> {
     let config = config::load()?;
     let client = pixoo::Client::new(&config.pixoo_ip);
     let mut tracker = Tracker::new(Duration::from_secs(config.idle_restore_secs));
+    let mut restore = RestoreTarget::new(config.restore_channel);
 
     let rx = spawn_playerctl_reader()?;
     loop {
@@ -35,23 +58,44 @@ fn main() -> Result<()> {
             }
         };
         if let Some(action) = action {
-            apply(&client, &config, &mut tracker, action);
+            apply(&client, &mut tracker, &mut restore, action);
         }
     }
 }
 
-fn apply(client: &pixoo::Client, config: &config::Config, tracker: &mut Tracker, action: Action) {
+fn apply(
+    client: &pixoo::Client,
+    tracker: &mut Tracker,
+    restore: &mut RestoreTarget,
+    action: Action,
+) {
     let result = match &action {
-        Action::ShowArtwork(url) => artwork::load(url)
-            .and_then(|bytes| artwork::rgb888_scaled(&bytes, pixoo::SIZE))
-            .and_then(|rgb| client.show_frame(&rgb)),
-        Action::RestoreChannel => client.restore_channel(config.restore_channel),
+        Action::ShowArtwork {
+            url,
+            takes_ownership,
+        } => {
+            // Capture before drawing: drawing itself can alter what
+            // Channel/GetIndex reports.
+            if *takes_ownership && restore.configured.is_none() {
+                match client.get_index() {
+                    Ok(index) => {
+                        restore.captured = index;
+                        println!("captured channel {index} to restore later");
+                    }
+                    Err(err) => eprintln!("could not capture current channel: {err:#}"),
+                }
+            }
+            artwork::load(url)
+                .and_then(|bytes| artwork::rgb888_scaled(&bytes, pixoo::SIZE))
+                .and_then(|rgb| client.show_frame(&rgb))
+        }
+        Action::RestoreChannel => client.restore_channel(restore.current()),
     };
     match result {
         Ok(()) => println!("done: {action:?}"),
         Err(err) => {
             eprintln!("failed: {action:?}: {err:#}");
-            if matches!(action, Action::ShowArtwork(_)) {
+            if matches!(action, Action::ShowArtwork { .. }) {
                 tracker.forget_shown_art();
             }
         }
@@ -113,4 +157,24 @@ fn which_playerctl() -> Result<()> {
         .status()
         .context("playerctl not found in PATH — install it first")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_restore_channel_wins_over_captured() {
+        let mut r = RestoreTarget::new(Some(2));
+        r.captured = 0;
+        assert_eq!(r.current(), 2);
+    }
+
+    #[test]
+    fn unconfigured_restore_uses_captured_channel() {
+        let mut r = RestoreTarget::new(None);
+        assert_eq!(r.current(), FALLBACK_CHANNEL);
+        r.captured = 0;
+        assert_eq!(r.current(), 0);
+    }
 }

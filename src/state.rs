@@ -4,7 +4,13 @@ use crate::metadata::{NowPlaying, PlayStatus};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
-    ShowArtwork(String),
+    /// `takes_ownership` is true when this draw takes the screen over from
+    /// the device's own channel (as opposed to replacing our previous
+    /// artwork) — the moment to capture which channel to restore later.
+    ShowArtwork {
+        url: String,
+        takes_ownership: bool,
+    },
     RestoreChannel,
 }
 
@@ -37,9 +43,13 @@ impl Tracker {
                 if self.owning && self.shown_art.as_deref() == Some(url) {
                     return None;
                 }
+                let takes_ownership = !self.owning;
                 self.owning = true;
                 self.shown_art = Some(url.clone());
-                Some(Action::ShowArtwork(url.clone()))
+                Some(Action::ShowArtwork {
+                    url: url.clone(),
+                    takes_ownership,
+                })
             }
             // Playing without an artUrl falls through to the idle countdown:
             // sustained artless playback (radio streams) hands the screen
@@ -91,14 +101,25 @@ mod tests {
         }
     }
 
+    fn playing_no_art() -> NowPlaying {
+        NowPlaying {
+            status: PlayStatus::Playing,
+            art_url: None,
+        }
+    }
+
+    fn show(url: &str, takes_ownership: bool) -> Action {
+        Action::ShowArtwork {
+            url: url.to_string(),
+            takes_ownership,
+        }
+    }
+
     #[test]
-    fn shows_artwork_when_playback_starts() {
+    fn first_draw_takes_ownership() {
         let mut t = Tracker::new(IDLE);
         let now = Instant::now();
-        assert_eq!(
-            t.on_update(Some(&playing("a")), now),
-            Some(Action::ShowArtwork("a".to_string()))
-        );
+        assert_eq!(t.on_update(Some(&playing("a")), now), Some(show("a", true)));
     }
 
     #[test]
@@ -110,13 +131,13 @@ mod tests {
     }
 
     #[test]
-    fn redraws_on_track_change() {
+    fn track_change_redraws_without_taking_ownership() {
         let mut t = Tracker::new(IDLE);
         let now = Instant::now();
         t.on_update(Some(&playing("a")), now);
         assert_eq!(
             t.on_update(Some(&playing("b")), now),
-            Some(Action::ShowArtwork("b".to_string()))
+            Some(show("b", false))
         );
     }
 
@@ -144,7 +165,7 @@ mod tests {
     }
 
     #[test]
-    fn shows_artwork_again_after_restore() {
+    fn draw_after_restore_takes_ownership_again() {
         let mut t = Tracker::new(IDLE);
         let start = Instant::now();
         t.on_update(Some(&playing("a")), start);
@@ -152,7 +173,7 @@ mod tests {
         t.tick(start + IDLE);
         assert_eq!(
             t.on_update(Some(&playing("a")), start + IDLE * 2),
-            Some(Action::ShowArtwork("a".to_string()))
+            Some(show("a", true))
         );
     }
 
@@ -171,13 +192,6 @@ mod tests {
         t.on_update(Some(&playing("a")), start);
         assert_eq!(t.on_update(None, start), None);
         assert_eq!(t.tick(start + IDLE), Some(Action::RestoreChannel));
-    }
-
-    fn playing_no_art() -> NowPlaying {
-        NowPlaying {
-            status: PlayStatus::Playing,
-            art_url: None,
-        }
     }
 
     #[test]
@@ -200,7 +214,7 @@ mod tests {
         assert_eq!(t.on_update(Some(&playing_no_art()), start), None);
         assert_eq!(
             t.on_update(Some(&playing("b")), start + Duration::from_secs(1)),
-            Some(Action::ShowArtwork("b".to_string()))
+            Some(show("b", false))
         );
         assert_eq!(t.tick(start + IDLE * 2), None);
     }
@@ -214,14 +228,14 @@ mod tests {
     }
 
     #[test]
-    fn forget_shown_art_forces_redraw() {
+    fn forget_shown_art_forces_redraw_without_reclaiming_ownership() {
         let mut t = Tracker::new(IDLE);
         let now = Instant::now();
         t.on_update(Some(&playing("a")), now);
         t.forget_shown_art();
         assert_eq!(
             t.on_update(Some(&playing("a")), now),
-            Some(Action::ShowArtwork("a".to_string()))
+            Some(show("a", false))
         );
     }
 }
