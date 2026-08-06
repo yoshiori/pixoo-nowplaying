@@ -25,7 +25,10 @@ fn main() -> Result<()> {
     let rx = spawn_playerctl_reader()?;
     loop {
         let action = match rx.recv_timeout(TICK_INTERVAL) {
-            Ok(line) => tracker.on_update(metadata::parse_line(&line).as_ref(), Instant::now()),
+            Ok(line) => {
+                println!("recv: {line:?}");
+                tracker.on_update(metadata::parse_line(&line).as_ref(), Instant::now())
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => tracker.tick(Instant::now()),
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 anyhow::bail!("playerctl reader thread died")
@@ -44,10 +47,13 @@ fn apply(client: &pixoo::Client, config: &config::Config, tracker: &mut Tracker,
             .and_then(|rgb| client.show_frame(&rgb)),
         Action::RestoreChannel => client.set_channel(config.restore_channel),
     };
-    if let Err(err) = result {
-        eprintln!("{action:?} failed: {err:#}");
-        if matches!(action, Action::ShowArtwork(_)) {
-            tracker.forget_shown_art();
+    match result {
+        Ok(()) => println!("done: {action:?}"),
+        Err(err) => {
+            eprintln!("failed: {action:?}: {err:#}");
+            if matches!(action, Action::ShowArtwork(_)) {
+                tracker.forget_shown_art();
+            }
         }
     }
 }
@@ -55,6 +61,7 @@ fn apply(client: &pixoo::Client, config: &config::Config, tracker: &mut Tracker,
 /// Streams `playerctl --follow` lines on a channel. An empty line means "no
 /// active player". playerctl exits when no player is around (version
 /// dependent), so keep respawning it — same strategy as the polybar script.
+/// stderr is inherited so playerctl's own errors reach the daemon's log.
 fn spawn_playerctl_reader() -> Result<mpsc::Receiver<String>> {
     which_playerctl()?;
     let (tx, rx) = mpsc::channel();
@@ -62,19 +69,31 @@ fn spawn_playerctl_reader() -> Result<mpsc::Receiver<String>> {
         match Command::new("playerctl")
             .args(["--follow", "metadata", "--format", PLAYERCTL_FORMAT])
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
             .spawn()
         {
             Ok(mut child) => {
                 if let Some(stdout) = child.stdout.take() {
-                    for line in BufReader::new(stdout).lines().map_while(|l| l.ok()) {
-                        if tx.send(line).is_err() {
-                            let _ = child.kill();
-                            return;
+                    let mut reader = BufReader::new(stdout);
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match reader.read_line(&mut line) {
+                            Ok(0) => break,
+                            Ok(_) => {
+                                if tx.send(line.trim_end().to_string()).is_err() {
+                                    let _ = child.kill();
+                                    return;
+                                }
+                            }
+                            Err(err) => {
+                                eprintln!("playerctl read error: {err}");
+                                break;
+                            }
                         }
                     }
                 }
                 let _ = child.wait();
+                eprintln!("playerctl exited; respawning in {RESPAWN_DELAY:?}");
             }
             Err(err) => eprintln!("failed to spawn playerctl: {err}"),
         }

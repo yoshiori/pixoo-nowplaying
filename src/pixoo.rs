@@ -33,17 +33,26 @@ pub fn set_channel_payload(index: u8) -> Value {
 
 pub struct Client {
     endpoint: String,
+    agent: ureq::Agent,
 }
 
 impl Client {
     pub fn new(ip: &str) -> Self {
         Self {
             endpoint: format!("http://{ip}/post"),
+            // The Pixoo's embedded HTTP server handles kept-alive connections
+            // poorly across long idle gaps, so pooling is disabled.
+            agent: ureq::AgentBuilder::new()
+                .timeout(std::time::Duration::from_secs(10))
+                .max_idle_connections(0)
+                .build(),
         }
     }
 
     fn post(&self, payload: &Value) -> Result<()> {
-        let body: Value = ureq::post(&self.endpoint)
+        let body: Value = self
+            .agent
+            .post(&self.endpoint)
             .send_json(payload)
             .with_context(|| format!("POST {} failed", self.endpoint))?
             .into_json()

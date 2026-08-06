@@ -12,7 +12,11 @@ pub fn load(url: &str) -> Result<Vec<u8>> {
         let path = percent_decode(path);
         std::fs::read(&path).with_context(|| format!("failed to read {path}"))
     } else if url.starts_with("http://") || url.starts_with("https://") {
-        let response = ureq::get(url)
+        let agent = ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(15))
+            .build();
+        let response = agent
+            .get(url)
             .call()
             .with_context(|| format!("failed to fetch {url}"))?;
         let mut bytes = Vec::new();
