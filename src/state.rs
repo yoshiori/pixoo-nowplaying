@@ -41,13 +41,10 @@ impl Tracker {
                 self.shown_art = Some(url.clone());
                 Some(Action::ShowArtwork(url.clone()))
             }
-            Some(NowPlaying {
-                status: PlayStatus::Playing,
-                art_url: None,
-            }) => {
-                self.idle_since = None;
-                None
-            }
+            // Playing without an artUrl falls through to the idle countdown:
+            // sustained artless playback (radio streams) hands the screen
+            // back, while the transient artless event Spotify emits on track
+            // start is absorbed by the grace period.
             _ => {
                 if self.owning && self.idle_since.is_none() {
                     self.idle_since = Some(now);
@@ -176,21 +173,43 @@ mod tests {
         assert_eq!(t.tick(start + IDLE), Some(Action::RestoreChannel));
     }
 
+    fn playing_no_art() -> NowPlaying {
+        NowPlaying {
+            status: PlayStatus::Playing,
+            art_url: None,
+        }
+    }
+
     #[test]
-    fn playing_without_art_keeps_current_display() {
+    fn sustained_artless_playback_restores_after_timeout() {
         let mut t = Tracker::new(IDLE);
         let start = Instant::now();
         t.on_update(Some(&playing("a")), start);
-        t.on_update(Some(&paused()), start);
-        let no_art = NowPlaying {
-            status: PlayStatus::Playing,
-            art_url: None,
-        };
+        assert_eq!(t.on_update(Some(&playing_no_art()), start), None);
+        assert_eq!(t.tick(start + IDLE - Duration::from_secs(1)), None);
+        assert_eq!(t.tick(start + IDLE), Some(Action::RestoreChannel));
+    }
+
+    #[test]
+    fn transient_artless_event_does_not_restore_when_art_follows() {
+        // Spotify sends a Playing event without artUrl for an instant on
+        // track start; the idle grace period must absorb it.
+        let mut t = Tracker::new(IDLE);
+        let start = Instant::now();
+        t.on_update(Some(&playing("a")), start);
+        assert_eq!(t.on_update(Some(&playing_no_art()), start), None);
         assert_eq!(
-            t.on_update(Some(&no_art), start + Duration::from_secs(5)),
-            None
+            t.on_update(Some(&playing("b")), start + Duration::from_secs(1)),
+            Some(Action::ShowArtwork("b".to_string()))
         );
-        // idle countdown was cancelled by playback
+        assert_eq!(t.tick(start + IDLE * 2), None);
+    }
+
+    #[test]
+    fn artless_playback_without_prior_drawing_does_nothing() {
+        let mut t = Tracker::new(IDLE);
+        let start = Instant::now();
+        assert_eq!(t.on_update(Some(&playing_no_art()), start), None);
         assert_eq!(t.tick(start + IDLE * 2), None);
     }
 
