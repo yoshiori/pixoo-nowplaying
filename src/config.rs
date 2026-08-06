@@ -21,7 +21,15 @@ fn default_idle_restore_secs() -> u64 {
 }
 
 pub fn parse(s: &str) -> Result<Config> {
-    toml::from_str(s).context("invalid config")
+    let config: Config = toml::from_str(s).context("invalid config")?;
+    if let Some(channel) = config.restore_channel {
+        anyhow::ensure!(
+            channel < crate::pixoo::CHANNEL_COUNT,
+            "restore_channel must be 0-{} (got {channel})",
+            crate::pixoo::CHANNEL_COUNT - 1
+        );
+    }
+    Ok(config)
 }
 
 pub fn config_path() -> Result<PathBuf> {
@@ -68,5 +76,11 @@ mod tests {
     #[test]
     fn missing_ip_is_an_error() {
         assert!(parse("restore_channel = 1").is_err());
+    }
+
+    #[test]
+    fn out_of_range_restore_channel_is_an_error() {
+        let err = parse("pixoo_ip = \"10.0.0.5\"\nrestore_channel = 255").unwrap_err();
+        assert!(err.to_string().contains("restore_channel"));
     }
 }

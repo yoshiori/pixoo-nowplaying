@@ -16,7 +16,6 @@ use state::{Action, Tracker};
 const PLAYERCTL_FORMAT: &str = "{{status}}\t{{mpris:artUrl}}";
 const RESPAWN_DELAY: Duration = Duration::from_secs(2);
 const TICK_INTERVAL: Duration = Duration::from_secs(1);
-
 const FALLBACK_CHANNEL: u8 = 1;
 
 /// Which channel to hand the screen back to. A configured value always wins;
@@ -47,17 +46,23 @@ fn main() -> Result<()> {
 
     let rx = spawn_playerctl_reader()?;
     loop {
-        let action = match rx.recv_timeout(TICK_INTERVAL) {
+        match rx.recv_timeout(TICK_INTERVAL) {
             Ok(line) => {
                 println!("recv: {line:?}");
-                tracker.on_update(metadata::parse_line(&line).as_ref(), Instant::now())
+                tracker.observe(metadata::parse_line(&line).as_ref(), Instant::now());
+                // Drain the backlog so a slow HTTP action doesn't make us
+                // draw artwork for tracks the user has already skipped past.
+                while let Ok(line) = rx.try_recv() {
+                    println!("recv: {line:?}");
+                    tracker.observe(metadata::parse_line(&line).as_ref(), Instant::now());
+                }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => tracker.tick(Instant::now()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 anyhow::bail!("playerctl reader thread died")
             }
-        };
-        if let Some(action) = action {
+        }
+        if let Some(action) = tracker.decide(Instant::now()) {
             apply(&client, &mut tracker, &mut restore, action);
         }
     }
@@ -69,36 +74,52 @@ fn apply(
     restore: &mut RestoreTarget,
     action: Action,
 ) {
-    let result = match &action {
+    match action {
         Action::ShowArtwork {
             url,
             takes_ownership,
         } => {
             // Capture before drawing: drawing itself can alter what
-            // Channel/GetIndex reports.
-            if *takes_ownership && restore.configured.is_none() {
+            // Channel/GetIndex reports. A failed capture fails the whole
+            // action — never take the screen without knowing how to give it
+            // back — and the tracker retries after its backoff.
+            if takes_ownership && restore.configured.is_none() {
                 match client.get_index() {
                     Ok(index) => {
                         restore.captured = index;
                         println!("captured channel {index} to restore later");
                     }
-                    Err(err) => eprintln!("could not capture current channel: {err:#}"),
+                    Err(err) => {
+                        eprintln!("failed: capturing current channel: {err:#}");
+                        tracker.show_failed(Instant::now());
+                        return;
+                    }
                 }
             }
-            artwork::load(url)
+            let result = artwork::load(&url)
                 .and_then(|bytes| artwork::rgb888_scaled(&bytes, pixoo::SIZE))
-                .and_then(|rgb| client.show_frame(&rgb))
-        }
-        Action::RestoreChannel => client.restore_channel(restore.current()),
-    };
-    match result {
-        Ok(()) => println!("done: {action:?}"),
-        Err(err) => {
-            eprintln!("failed: {action:?}: {err:#}");
-            if matches!(action, Action::ShowArtwork { .. }) {
-                tracker.forget_shown_art();
+                .and_then(|rgb| client.show_frame(&rgb));
+            match result {
+                Ok(()) => {
+                    tracker.shown(&url);
+                    println!("done: drew artwork {url}");
+                }
+                Err(err) => {
+                    eprintln!("failed: drawing {url}: {err:#}");
+                    tracker.show_failed(Instant::now());
+                }
             }
         }
+        Action::RestoreChannel => match client.restore_channel(restore.current()) {
+            Ok(()) => {
+                tracker.restored();
+                println!("done: restored channel {}", restore.current());
+            }
+            Err(err) => {
+                eprintln!("failed: restoring channel {}: {err:#}", restore.current());
+                tracker.restore_failed(Instant::now());
+            }
+        },
     }
 }
 
@@ -118,14 +139,18 @@ fn spawn_playerctl_reader() -> Result<mpsc::Receiver<String>> {
             Ok(mut child) => {
                 if let Some(stdout) = child.stdout.take() {
                     let mut reader = BufReader::new(stdout);
-                    let mut line = String::new();
+                    let mut buf = Vec::new();
                     loop {
-                        line.clear();
-                        match reader.read_line(&mut line) {
+                        buf.clear();
+                        // read_until + lossy conversion: a non-UTF-8 byte in
+                        // a metadata line must not kill the stream.
+                        match reader.read_until(b'\n', &mut buf) {
                             Ok(0) => break,
                             Ok(_) => {
-                                if tx.send(line.trim_end().to_string()).is_err() {
+                                let line = String::from_utf8_lossy(&buf).trim_end().to_string();
+                                if tx.send(line).is_err() {
                                     let _ = child.kill();
+                                    let _ = child.wait();
                                     return;
                                 }
                             }
@@ -135,6 +160,9 @@ fn spawn_playerctl_reader() -> Result<mpsc::Receiver<String>> {
                             }
                         }
                     }
+                    // Kill before wait: on a read error the child may still
+                    // be alive, and wait() on a live --follow blocks forever.
+                    let _ = child.kill();
                 }
                 let _ = child.wait();
                 eprintln!("playerctl exited; respawning in {RESPAWN_DELAY:?}");

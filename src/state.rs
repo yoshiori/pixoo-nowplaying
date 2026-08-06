@@ -14,70 +14,115 @@ pub enum Action {
     RestoreChannel,
 }
 
-/// Decides when to draw artwork and when to give the screen back to the
-/// Pixoo's own channel. Time is injected so transitions are testable.
+/// Retry gate after a failed HTTP action (draw or restore).
+const RETRY_DELAY: Duration = Duration::from_secs(5);
+
+/// Minimum grace before artless playback hands the screen back, independent
+/// of idle_restore_secs: Spotify emits a transient artless Playing event on
+/// track start, and a small user-configured idle timeout must never let that
+/// transient trigger a restore.
+const ARTLESS_MIN_GRACE: Duration = Duration::from_secs(5);
+
+/// Decides what should be on the Pixoo. `observe` ingests player state,
+/// `decide` reconciles it against what is actually drawn, and the outcome
+/// callbacks (`shown`/`show_failed`/`restored`/`restore_failed`) feed HTTP
+/// results back so failed actions are retried instead of dropped. Time is
+/// injected so transitions are testable.
 pub struct Tracker {
     idle_after: Duration,
-    shown_art: Option<String>,
+    /// Some(url) iff the latest player state is Playing with artwork.
+    playing_art: Option<String>,
+    /// The latest player state is Playing but without artwork.
+    artless_playing: bool,
+    /// When playback stopped being drawable while our artwork was on screen.
     idle_since: Option<Instant>,
-    owning: bool,
+    /// Artwork actually on the device (None = the device owns its screen).
+    drawn_url: Option<String>,
+    /// Earliest time the next attempt may run after a failure.
+    next_attempt: Option<Instant>,
 }
 
 impl Tracker {
     pub fn new(idle_after: Duration) -> Self {
         Self {
             idle_after,
-            shown_art: None,
+            playing_art: None,
+            artless_playing: false,
             idle_since: None,
-            owning: false,
+            drawn_url: None,
+            next_attempt: None,
         }
     }
 
-    pub fn on_update(&mut self, np: Option<&NowPlaying>, now: Instant) -> Option<Action> {
-        match np {
+    pub fn observe(&mut self, np: Option<&NowPlaying>, now: Instant) {
+        let (playing_art, artless_playing) = match np {
             Some(NowPlaying {
                 status: PlayStatus::Playing,
                 art_url: Some(url),
-            }) => {
-                self.idle_since = None;
-                if self.owning && self.shown_art.as_deref() == Some(url) {
+            }) => (Some(url.clone()), false),
+            Some(NowPlaying {
+                status: PlayStatus::Playing,
+                art_url: None,
+            }) => (None, true),
+            _ => (None, false),
+        };
+        if playing_art != self.playing_art {
+            // The goal changed; don't make a stale failure delay it.
+            self.next_attempt = None;
+        }
+        if playing_art.is_some() {
+            self.idle_since = None;
+        } else if self.drawn_url.is_some() && self.idle_since.is_none() {
+            self.idle_since = Some(now);
+        }
+        self.playing_art = playing_art;
+        self.artless_playing = artless_playing;
+    }
+
+    pub fn decide(&self, now: Instant) -> Option<Action> {
+        if self.next_attempt.is_some_and(|t| now < t) {
+            return None;
+        }
+        match &self.playing_art {
+            Some(url) => {
+                if self.drawn_url.as_deref() == Some(url) {
                     return None;
                 }
-                let takes_ownership = !self.owning;
-                self.owning = true;
-                self.shown_art = Some(url.clone());
                 Some(Action::ShowArtwork {
                     url: url.clone(),
-                    takes_ownership,
+                    takes_ownership: self.drawn_url.is_none(),
                 })
             }
-            // Playing without an artUrl falls through to the idle countdown:
-            // sustained artless playback (radio streams) hands the screen
-            // back, while the transient artless event Spotify emits on track
-            // start is absorbed by the grace period.
-            _ => {
-                if self.owning && self.idle_since.is_none() {
-                    self.idle_since = Some(now);
-                }
-                self.tick(now)
+            None => {
+                self.drawn_url.as_ref()?;
+                let since = self.idle_since?;
+                let grace = if self.artless_playing {
+                    self.idle_after.max(ARTLESS_MIN_GRACE)
+                } else {
+                    self.idle_after
+                };
+                (now.duration_since(since) >= grace).then_some(Action::RestoreChannel)
             }
         }
     }
 
-    pub fn tick(&mut self, now: Instant) -> Option<Action> {
-        let idle_since = self.idle_since?;
-        if self.owning && now.duration_since(idle_since) >= self.idle_after {
-            self.owning = false;
-            self.idle_since = None;
-            self.shown_art = None;
-            return Some(Action::RestoreChannel);
-        }
-        None
+    pub fn shown(&mut self, url: &str) {
+        self.drawn_url = Some(url.to_string());
+        self.next_attempt = None;
     }
 
-    /// Called when drawing failed, so the same URL is retried on the next update.
-    pub fn forget_shown_art(&mut self) {
-        self.shown_art = None;
+    pub fn show_failed(&mut self, now: Instant) {
+        self.next_attempt = Some(now + RETRY_DELAY);
+    }
+
+    pub fn restored(&mut self) {
+        self.drawn_url = None;
+        self.idle_since = None;
+        self.next_attempt = None;
+    }
+
+    pub fn restore_failed(&mut self, now: Instant) {
+        self.next_attempt = Some(now + RETRY_DELAY);
     }
 }
 
@@ -86,26 +131,17 @@ mod tests {
     use super::*;
 
     const IDLE: Duration = Duration::from_secs(30);
+    const SEC: Duration = Duration::from_secs(1);
+
+    fn np(status: PlayStatus, art: Option<&str>) -> NowPlaying {
+        NowPlaying {
+            status,
+            art_url: art.map(String::from),
+        }
+    }
 
     fn playing(url: &str) -> NowPlaying {
-        NowPlaying {
-            status: PlayStatus::Playing,
-            art_url: Some(url.to_string()),
-        }
-    }
-
-    fn paused() -> NowPlaying {
-        NowPlaying {
-            status: PlayStatus::Paused,
-            art_url: Some("x".to_string()),
-        }
-    }
-
-    fn playing_no_art() -> NowPlaying {
-        NowPlaying {
-            status: PlayStatus::Playing,
-            art_url: None,
-        }
+        np(PlayStatus::Playing, Some(url))
     }
 
     fn show(url: &str, takes_ownership: bool) -> Action {
@@ -115,127 +151,186 @@ mod tests {
         }
     }
 
+    /// observe + decide + report success, mirroring the main loop's happy path.
+    fn play_and_draw(t: &mut Tracker, url: &str, now: Instant) {
+        t.observe(Some(&playing(url)), now);
+        match t.decide(now) {
+            Some(Action::ShowArtwork { url, .. }) => t.shown(&url),
+            other => panic!("expected ShowArtwork, got {other:?}"),
+        }
+    }
+
     #[test]
     fn first_draw_takes_ownership() {
         let mut t = Tracker::new(IDLE);
         let now = Instant::now();
-        assert_eq!(t.on_update(Some(&playing("a")), now), Some(show("a", true)));
+        t.observe(Some(&playing("a")), now);
+        assert_eq!(t.decide(now), Some(show("a", true)));
     }
 
     #[test]
-    fn does_not_redraw_same_artwork() {
+    fn successful_draw_is_not_repeated() {
         let mut t = Tracker::new(IDLE);
         let now = Instant::now();
-        t.on_update(Some(&playing("a")), now);
-        assert_eq!(t.on_update(Some(&playing("a")), now), None);
+        play_and_draw(&mut t, "a", now);
+        assert_eq!(t.decide(now + SEC), None);
+        t.observe(Some(&playing("a")), now + SEC);
+        assert_eq!(t.decide(now + SEC), None);
     }
 
     #[test]
     fn track_change_redraws_without_taking_ownership() {
         let mut t = Tracker::new(IDLE);
         let now = Instant::now();
-        t.on_update(Some(&playing("a")), now);
-        assert_eq!(
-            t.on_update(Some(&playing("b")), now),
-            Some(show("b", false))
-        );
+        play_and_draw(&mut t, "a", now);
+        t.observe(Some(&playing("b")), now);
+        assert_eq!(t.decide(now), Some(show("b", false)));
+    }
+
+    #[test]
+    fn failed_draw_is_retried_on_tick_after_backoff() {
+        let mut t = Tracker::new(IDLE);
+        let now = Instant::now();
+        t.observe(Some(&playing("a")), now);
+        assert_eq!(t.decide(now), Some(show("a", true)));
+        t.show_failed(now);
+        // No new playerctl event needed: pure time passing re-arms the draw.
+        assert_eq!(t.decide(now + SEC), None);
+        assert_eq!(t.decide(now + RETRY_DELAY), Some(show("a", true)));
+    }
+
+    #[test]
+    fn failed_first_draw_keeps_ownership_unclaimed() {
+        // The retry must still capture the restore channel (takes_ownership
+        // stays true) because nothing was actually drawn.
+        let mut t = Tracker::new(IDLE);
+        let now = Instant::now();
+        t.observe(Some(&playing("a")), now);
+        t.decide(now);
+        t.show_failed(now);
+        assert_eq!(t.decide(now + RETRY_DELAY), Some(show("a", true)));
+    }
+
+    #[test]
+    fn no_restore_when_nothing_was_ever_drawn() {
+        // A failed draw must not lead to a phantom restore bounce.
+        let mut t = Tracker::new(IDLE);
+        let now = Instant::now();
+        t.observe(Some(&playing("a")), now);
+        t.decide(now);
+        t.show_failed(now);
+        t.observe(Some(&np(PlayStatus::Paused, Some("a"))), now + SEC);
+        assert_eq!(t.decide(now + SEC + IDLE * 2), None);
     }
 
     #[test]
     fn restores_channel_after_idle_timeout() {
         let mut t = Tracker::new(IDLE);
-        let start = Instant::now();
-        t.on_update(Some(&playing("a")), start);
-        assert_eq!(t.on_update(Some(&paused()), start), None);
-        assert_eq!(t.tick(start + IDLE - Duration::from_secs(1)), None);
-        assert_eq!(t.tick(start + IDLE), Some(Action::RestoreChannel));
+        let now = Instant::now();
+        play_and_draw(&mut t, "a", now);
+        t.observe(Some(&np(PlayStatus::Paused, Some("a"))), now);
+        assert_eq!(t.decide(now + IDLE - SEC), None);
+        assert_eq!(t.decide(now + IDLE), Some(Action::RestoreChannel));
+    }
+
+    #[test]
+    fn failed_restore_is_retried_until_it_succeeds() {
+        let mut t = Tracker::new(IDLE);
+        let now = Instant::now();
+        play_and_draw(&mut t, "a", now);
+        t.observe(None, now);
+        assert_eq!(t.decide(now + IDLE), Some(Action::RestoreChannel));
+        t.restore_failed(now + IDLE);
+        assert_eq!(t.decide(now + IDLE + SEC), None);
+        assert_eq!(
+            t.decide(now + IDLE + RETRY_DELAY),
+            Some(Action::RestoreChannel)
+        );
+        t.restored();
+        assert_eq!(t.decide(now + IDLE * 2), None);
     }
 
     #[test]
     fn resume_before_timeout_cancels_restore() {
         let mut t = Tracker::new(IDLE);
-        let start = Instant::now();
-        t.on_update(Some(&playing("a")), start);
-        t.on_update(Some(&paused()), start);
-        assert_eq!(
-            t.on_update(Some(&playing("a")), start + Duration::from_secs(5)),
-            None
-        );
-        assert_eq!(t.tick(start + IDLE * 2), None);
+        let now = Instant::now();
+        play_and_draw(&mut t, "a", now);
+        t.observe(Some(&np(PlayStatus::Paused, Some("a"))), now);
+        t.observe(Some(&playing("a")), now + Duration::from_secs(5));
+        assert_eq!(t.decide(now + IDLE * 2), None);
     }
 
     #[test]
     fn draw_after_restore_takes_ownership_again() {
         let mut t = Tracker::new(IDLE);
-        let start = Instant::now();
-        t.on_update(Some(&playing("a")), start);
-        t.on_update(Some(&paused()), start);
-        t.tick(start + IDLE);
-        assert_eq!(
-            t.on_update(Some(&playing("a")), start + IDLE * 2),
-            Some(show("a", true))
-        );
+        let now = Instant::now();
+        play_and_draw(&mut t, "a", now);
+        t.observe(None, now);
+        assert_eq!(t.decide(now + IDLE), Some(Action::RestoreChannel));
+        t.restored();
+        t.observe(Some(&playing("a")), now + IDLE * 2);
+        assert_eq!(t.decide(now + IDLE * 2), Some(show("a", true)));
     }
 
     #[test]
-    fn no_restore_when_nothing_was_drawn() {
+    fn no_player_starts_idle_countdown() {
         let mut t = Tracker::new(IDLE);
-        let start = Instant::now();
-        assert_eq!(t.on_update(None, start), None);
-        assert_eq!(t.tick(start + IDLE * 2), None);
-    }
-
-    #[test]
-    fn no_player_line_starts_idle_countdown() {
-        let mut t = Tracker::new(IDLE);
-        let start = Instant::now();
-        t.on_update(Some(&playing("a")), start);
-        assert_eq!(t.on_update(None, start), None);
-        assert_eq!(t.tick(start + IDLE), Some(Action::RestoreChannel));
+        let now = Instant::now();
+        play_and_draw(&mut t, "a", now);
+        t.observe(None, now);
+        assert_eq!(t.decide(now + IDLE), Some(Action::RestoreChannel));
     }
 
     #[test]
     fn sustained_artless_playback_restores_after_timeout() {
         let mut t = Tracker::new(IDLE);
-        let start = Instant::now();
-        t.on_update(Some(&playing("a")), start);
-        assert_eq!(t.on_update(Some(&playing_no_art()), start), None);
-        assert_eq!(t.tick(start + IDLE - Duration::from_secs(1)), None);
-        assert_eq!(t.tick(start + IDLE), Some(Action::RestoreChannel));
+        let now = Instant::now();
+        play_and_draw(&mut t, "a", now);
+        t.observe(Some(&np(PlayStatus::Playing, None)), now);
+        assert_eq!(t.decide(now + IDLE - SEC), None);
+        assert_eq!(t.decide(now + IDLE), Some(Action::RestoreChannel));
     }
 
     #[test]
-    fn transient_artless_event_does_not_restore_when_art_follows() {
-        // Spotify sends a Playing event without artUrl for an instant on
-        // track start; the idle grace period must absorb it.
-        let mut t = Tracker::new(IDLE);
-        let start = Instant::now();
-        t.on_update(Some(&playing("a")), start);
-        assert_eq!(t.on_update(Some(&playing_no_art()), start), None);
-        assert_eq!(
-            t.on_update(Some(&playing("b")), start + Duration::from_secs(1)),
-            Some(show("b", false))
-        );
-        assert_eq!(t.tick(start + IDLE * 2), None);
+    fn transient_artless_event_survives_tiny_idle_config() {
+        // With idle_restore_secs = 1, the artless transient at track start
+        // must still be absorbed by ARTLESS_MIN_GRACE.
+        let mut t = Tracker::new(SEC);
+        let now = Instant::now();
+        play_and_draw(&mut t, "a", now);
+        t.observe(Some(&np(PlayStatus::Playing, None)), now);
+        assert_eq!(t.decide(now + SEC * 2), None);
+        t.observe(Some(&playing("b")), now + SEC * 3);
+        assert_eq!(t.decide(now + SEC * 3), Some(show("b", false)));
+    }
+
+    #[test]
+    fn pause_with_tiny_idle_config_restores_fast() {
+        // ARTLESS_MIN_GRACE must not slow down the plain pause path.
+        let mut t = Tracker::new(SEC);
+        let now = Instant::now();
+        play_and_draw(&mut t, "a", now);
+        t.observe(Some(&np(PlayStatus::Paused, Some("a"))), now);
+        assert_eq!(t.decide(now + SEC), Some(Action::RestoreChannel));
     }
 
     #[test]
     fn artless_playback_without_prior_drawing_does_nothing() {
         let mut t = Tracker::new(IDLE);
-        let start = Instant::now();
-        assert_eq!(t.on_update(Some(&playing_no_art()), start), None);
-        assert_eq!(t.tick(start + IDLE * 2), None);
+        let now = Instant::now();
+        t.observe(Some(&np(PlayStatus::Playing, None)), now);
+        assert_eq!(t.decide(now + IDLE * 2), None);
     }
 
     #[test]
-    fn forget_shown_art_forces_redraw_without_reclaiming_ownership() {
+    fn track_change_clears_failure_backoff() {
         let mut t = Tracker::new(IDLE);
         let now = Instant::now();
-        t.on_update(Some(&playing("a")), now);
-        t.forget_shown_art();
-        assert_eq!(
-            t.on_update(Some(&playing("a")), now),
-            Some(show("a", false))
-        );
+        t.observe(Some(&playing("a")), now);
+        t.decide(now);
+        t.show_failed(now);
+        // A new track should draw immediately, not wait out a's backoff.
+        t.observe(Some(&playing("b")), now + SEC);
+        assert_eq!(t.decide(now + SEC), Some(show("b", true)));
     }
 }

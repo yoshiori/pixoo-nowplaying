@@ -5,6 +5,9 @@ use serde_json::{json, Value};
 
 pub const SIZE: u32 = 64;
 const FRAME_BYTES: usize = (SIZE * SIZE * 3) as usize;
+/// Draw/SendHttpGif per-frame duration; inert for our single-frame draws.
+const FRAME_DURATION_MS: u32 = 1000;
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub fn reset_gif_payload() -> Value {
     json!({ "Command": "Draw/ResetHttpGifId" })
@@ -22,7 +25,7 @@ pub fn frame_payload(rgb: &[u8]) -> Result<Value> {
         "PicWidth": SIZE,
         "PicOffset": 0,
         "PicID": 1,
-        "PicSpeed": 1000,
+        "PicSpeed": FRAME_DURATION_MS,
         "PicData": BASE64.encode(rgb),
     }))
 }
@@ -31,14 +34,14 @@ pub fn set_channel_payload(index: u8) -> Value {
     json!({ "Command": "Channel/SetIndex", "SelectIndex": index })
 }
 
-const CHANNEL_COUNT: u8 = 4;
+pub const CHANNEL_COUNT: u8 = 4;
 
 /// The Pixoo ignores Channel/SetIndex when it believes it is already on that
 /// channel, which leaves an HTTP-drawn frame on screen forever (drawing does
 /// not update SelectIndex). Restoring therefore bounces through a different
 /// channel first to force a real switch.
 pub fn bounce_index(target: u8) -> u8 {
-    (target + 1) % CHANNEL_COUNT
+    (target % CHANNEL_COUNT + 1) % CHANNEL_COUNT
 }
 
 pub struct Client {
@@ -53,7 +56,7 @@ impl Client {
             // The Pixoo's embedded HTTP server handles kept-alive connections
             // poorly across long idle gaps, so pooling is disabled.
             agent: ureq::AgentBuilder::new()
-                .timeout(std::time::Duration::from_secs(10))
+                .timeout(REQUEST_TIMEOUT)
                 .max_idle_connections(0)
                 .build(),
         }
@@ -75,12 +78,14 @@ impl Client {
 
     /// Best-effort: the reported SelectIndex does not always track what is
     /// actually displayed (see restore bounce), but it is the only way to
-    /// learn which channel the user had selected.
+    /// learn which channel the user had selected. Out-of-range values are
+    /// rejected so a firmware quirk cannot become a bad restore target.
     pub fn get_index(&self) -> Result<u8> {
         let body = self.post(&json!({ "Command": "Channel/GetIndex" }))?;
         body.get("SelectIndex")
             .and_then(Value::as_u64)
             .and_then(|i| u8::try_from(i).ok())
+            .filter(|i| *i < CHANNEL_COUNT)
             .context("Channel/GetIndex returned no usable SelectIndex")
     }
 
@@ -136,5 +141,11 @@ mod tests {
             assert_ne!(bounce, target);
             assert!(bounce < 4);
         }
+    }
+
+    #[test]
+    fn bounce_index_does_not_overflow_on_any_u8() {
+        // Defense in depth: callers validate range, but 255 must not panic.
+        assert!(bounce_index(255) < CHANNEL_COUNT);
     }
 }
