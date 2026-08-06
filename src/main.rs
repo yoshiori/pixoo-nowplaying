@@ -45,7 +45,7 @@ fn apply(client: &pixoo::Client, config: &config::Config, tracker: &mut Tracker,
         Action::ShowArtwork(url) => artwork::load(url)
             .and_then(|bytes| artwork::rgb888_scaled(&bytes, pixoo::SIZE))
             .and_then(|rgb| client.show_frame(&rgb)),
-        Action::RestoreChannel => client.set_channel(config.restore_channel),
+        Action::RestoreChannel => client.restore_channel(config.restore_channel),
     };
     match result {
         Ok(()) => println!("done: {action:?}"),

@@ -31,6 +31,16 @@ pub fn set_channel_payload(index: u8) -> Value {
     json!({ "Command": "Channel/SetIndex", "SelectIndex": index })
 }
 
+const CHANNEL_COUNT: u8 = 4;
+
+/// The Pixoo ignores Channel/SetIndex when it believes it is already on that
+/// channel, which leaves an HTTP-drawn frame on screen forever (drawing does
+/// not update SelectIndex). Restoring therefore bounces through a different
+/// channel first to force a real switch.
+pub fn bounce_index(target: u8) -> u8 {
+    (target + 1) % CHANNEL_COUNT
+}
+
 pub struct Client {
     endpoint: String,
     agent: ureq::Agent,
@@ -68,7 +78,8 @@ impl Client {
         self.post(&frame_payload(rgb)?)
     }
 
-    pub fn set_channel(&self, index: u8) -> Result<()> {
+    pub fn restore_channel(&self, index: u8) -> Result<()> {
+        self.post(&set_channel_payload(bounce_index(index)))?;
         self.post(&set_channel_payload(index))
     }
 }
@@ -103,5 +114,14 @@ mod tests {
     #[test]
     fn reset_payload_shape() {
         assert_eq!(reset_gif_payload()["Command"], "Draw/ResetHttpGifId");
+    }
+
+    #[test]
+    fn bounce_index_always_differs_from_target() {
+        for target in 0..4 {
+            let bounce = bounce_index(target);
+            assert_ne!(bounce, target);
+            assert!(bounce < 4);
+        }
     }
 }
