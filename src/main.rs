@@ -13,7 +13,8 @@ use anyhow::{Context, Result};
 
 use state::{Action, Tracker};
 
-const PLAYERCTL_FORMAT: &str = "{{status}}\t{{mpris:artUrl}}";
+use metadata::PLAYERCTL_FORMAT;
+
 const RESPAWN_DELAY: Duration = Duration::from_secs(2);
 const TICK_INTERVAL: Duration = Duration::from_secs(1);
 const FALLBACK_CHANNEL: u8 = 1;
@@ -44,15 +45,13 @@ fn main() -> Result<()> {
     let mut tracker = Tracker::new(Duration::from_secs(config.idle_restore_secs));
     let mut restore = RestoreTarget::new(config.restore_channel);
 
-    let rx = spawn_playerctl_reader()?;
+    let rx = spawn_playerctl_reader(&config.excluded_players)?;
     loop {
         match rx.recv_timeout(TICK_INTERVAL) {
             Ok(line) => {
-                println!("recv: {line:?}");
-                tracker.observe(metadata::parse_line(&line).as_ref(), Instant::now());
                 // Drain the backlog so a slow HTTP action doesn't make us
                 // draw artwork for tracks the user has already skipped past.
-                while let Ok(line) = rx.try_recv() {
+                for line in std::iter::once(line).chain(rx.try_iter()) {
                     println!("recv: {line:?}");
                     tracker.observe(metadata::parse_line(&line).as_ref(), Instant::now());
                 }
@@ -123,16 +122,29 @@ fn apply(
     }
 }
 
+/// Arguments for the `playerctl` subprocess. Excluded players are handed to
+/// playerctl itself via `--ignore-player`, so `--follow` falls through to the
+/// next player instead of going quiet while an excluded one is active.
+fn playerctl_args(excluded: &[String]) -> Vec<String> {
+    let mut args = Vec::new();
+    if !excluded.is_empty() {
+        args.push(format!("--ignore-player={}", excluded.join(",")));
+    }
+    args.extend(["--follow", "metadata", "--format", PLAYERCTL_FORMAT].map(String::from));
+    args
+}
+
 /// Streams `playerctl --follow` lines on a channel. An empty line means "no
 /// active player". playerctl exits when no player is around (version
 /// dependent), so keep respawning it — same strategy as the polybar script.
 /// stderr is inherited so playerctl's own errors reach the daemon's log.
-fn spawn_playerctl_reader() -> Result<mpsc::Receiver<String>> {
+fn spawn_playerctl_reader(excluded: &[String]) -> Result<mpsc::Receiver<String>> {
     which_playerctl()?;
+    let args = playerctl_args(excluded);
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || loop {
         match Command::new("playerctl")
-            .args(["--follow", "metadata", "--format", PLAYERCTL_FORMAT])
+            .args(&args)
             .stdout(Stdio::piped())
             .spawn()
         {
@@ -204,5 +216,28 @@ mod tests {
         assert_eq!(r.current(), FALLBACK_CHANNEL);
         r.captured = 0;
         assert_eq!(r.current(), 0);
+    }
+
+    #[test]
+    fn playerctl_args_without_exclusions() {
+        assert_eq!(
+            playerctl_args(&[]),
+            vec!["--follow", "metadata", "--format", PLAYERCTL_FORMAT]
+        );
+    }
+
+    #[test]
+    fn playerctl_args_pass_exclusions_as_ignore_player() {
+        let excluded = vec!["chromium".to_string(), "firefox".to_string()];
+        assert_eq!(
+            playerctl_args(&excluded),
+            vec![
+                "--ignore-player=chromium,firefox",
+                "--follow",
+                "metadata",
+                "--format",
+                PLAYERCTL_FORMAT,
+            ]
+        );
     }
 }

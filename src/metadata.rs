@@ -11,7 +11,11 @@ pub struct NowPlaying {
     pub art_url: Option<String>,
 }
 
-/// Parses one line of `playerctl --follow metadata --format "{{status}}\t{{mpris:artUrl}}"`.
+/// The `--format` template handed to playerctl. Lives next to [`parse_line`]
+/// because the two are one contract: change one, change the other.
+pub const PLAYERCTL_FORMAT: &str = "{{status}}\t{{mpris:artUrl}}";
+
+/// Parses one line of `playerctl --follow metadata --format PLAYERCTL_FORMAT`.
 /// Returns None for empty lines (no active player) or unknown statuses.
 pub fn parse_line(line: &str) -> Option<NowPlaying> {
     let line = line.trim_end_matches(['\r', '\n']);

@@ -14,6 +14,11 @@ pub struct Config {
     pub restore_channel: Option<u8>,
     #[serde(default = "default_idle_restore_secs")]
     pub idle_restore_secs: u64,
+    /// Players the daemon never follows, passed to playerctl as
+    /// `--ignore-player`. Names as reported by `playerctl -l`
+    /// (a base name also covers its `.instanceNNN` variants).
+    #[serde(default)]
+    pub excluded_players: Vec<String>,
 }
 
 fn default_idle_restore_secs() -> u64 {
@@ -21,12 +26,23 @@ fn default_idle_restore_secs() -> u64 {
 }
 
 pub fn parse(s: &str) -> Result<Config> {
-    let config: Config = toml::from_str(s).context("invalid config")?;
+    let mut config: Config = toml::from_str(s).context("invalid config")?;
     if let Some(channel) = config.restore_channel {
         anyhow::ensure!(
             channel < crate::pixoo::CHANNEL_COUNT,
             "restore_channel must be 0-{} (got {channel})",
             crate::pixoo::CHANNEL_COUNT - 1
+        );
+    }
+    // Entries become a comma-separated playerctl --ignore-player argument,
+    // so a comma or embedded whitespace would silently change what is
+    // ignored. Fail loudly instead.
+    for entry in &mut config.excluded_players {
+        *entry = entry.trim().to_string();
+        anyhow::ensure!(
+            !entry.is_empty() && !entry.contains([',', ' ', '\t']),
+            "excluded_players entries must be non-empty player names \
+             without commas or whitespace (got {entry:?})"
         );
     }
     Ok(config)
@@ -57,6 +73,46 @@ mod tests {
         assert_eq!(c.pixoo_ip, "192.168.0.153");
         assert_eq!(c.restore_channel, None);
         assert_eq!(c.idle_restore_secs, 30);
+        assert!(c.excluded_players.is_empty());
+    }
+
+    #[test]
+    fn parses_excluded_players_list() {
+        let c = parse(
+            r#"
+            pixoo_ip = "10.0.0.5"
+            excluded_players = ["chromium", "firefox"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.excluded_players, vec!["chromium", "firefox"]);
+    }
+
+    #[test]
+    fn excluded_players_entries_are_trimmed() {
+        let c = parse(
+            r#"
+            pixoo_ip = "10.0.0.5"
+            excluded_players = [" chromium ", "firefox"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.excluded_players, vec!["chromium", "firefox"]);
+    }
+
+    #[test]
+    fn empty_excluded_player_entry_is_an_error() {
+        let err = parse("pixoo_ip = \"10.0.0.5\"\nexcluded_players = [\"\"]").unwrap_err();
+        assert!(err.to_string().contains("excluded_players"));
+    }
+
+    #[test]
+    fn excluded_player_entry_with_comma_or_space_is_an_error() {
+        for entry in ["chromium,firefox", "chrom ium"] {
+            let toml = format!("pixoo_ip = \"10.0.0.5\"\nexcluded_players = [\"{entry}\"]");
+            let err = parse(&toml).unwrap_err();
+            assert!(err.to_string().contains("excluded_players"), "{entry}");
+        }
     }
 
     #[test]
