@@ -28,6 +28,11 @@ Optional config keys (defaults shown):
 idle_restore_secs = 30  # how long playback must be stopped before restoring
 # restore_channel = 1   # unset: restore to whatever channel was showing
                         # when artwork took over (Channel/GetIndex)
+# excluded_players = ["chromium", "firefox"]
+                        # never show artwork from these players (e.g. YouTube
+                        # thumbnails from a browser). Matched against
+                        # playerctl's {{playerName}}, case-insensitive,
+                        # ".instanceNNN" suffixes included
 ```
 
 ## Run

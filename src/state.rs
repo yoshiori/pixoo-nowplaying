@@ -59,10 +59,12 @@ impl Tracker {
             Some(NowPlaying {
                 status: PlayStatus::Playing,
                 art_url: Some(url),
+                ..
             }) => (Some(url.clone()), false),
             Some(NowPlaying {
                 status: PlayStatus::Playing,
                 art_url: None,
+                ..
             }) => (None, true),
             _ => (None, false),
         };
@@ -137,6 +139,7 @@ mod tests {
         NowPlaying {
             status,
             art_url: art.map(String::from),
+            player: None,
         }
     }
 
@@ -287,6 +290,25 @@ mod tests {
         let now = Instant::now();
         play_and_draw(&mut t, "a", now);
         t.observe(Some(&np(PlayStatus::Playing, None)), now);
+        assert_eq!(t.decide(now + IDLE - SEC), None);
+        assert_eq!(t.decide(now + IDLE), Some(Action::RestoreChannel));
+    }
+
+    #[test]
+    fn excluded_playback_restores_after_artless_grace() {
+        // An excluded player's line arrives with its artwork already
+        // stripped by parse_line_excluding; the tracker must treat it
+        // exactly like artless playback and hand the screen back.
+        let excluded = vec!["chromium".to_string()];
+        let mut t = Tracker::new(IDLE);
+        let now = Instant::now();
+        play_and_draw(&mut t, "a", now);
+        let np = crate::metadata::parse_line_excluding(
+            "chromium.instance99\tPlaying\thttps://i.ytimg.com/vi/x.jpg",
+            &excluded,
+        )
+        .unwrap();
+        t.observe(Some(&np), now);
         assert_eq!(t.decide(now + IDLE - SEC), None);
         assert_eq!(t.decide(now + IDLE), Some(Action::RestoreChannel));
     }

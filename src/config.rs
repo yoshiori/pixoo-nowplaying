@@ -14,6 +14,10 @@ pub struct Config {
     pub restore_channel: Option<u8>,
     #[serde(default = "default_idle_restore_secs")]
     pub idle_restore_secs: u64,
+    /// Players whose artwork is never shown (matched against playerctl's
+    /// `{{playerName}}`, including `.instanceNNN` suffixed variants).
+    #[serde(default)]
+    pub excluded_players: Vec<String>,
 }
 
 fn default_idle_restore_secs() -> u64 {
@@ -57,6 +61,19 @@ mod tests {
         assert_eq!(c.pixoo_ip, "192.168.0.153");
         assert_eq!(c.restore_channel, None);
         assert_eq!(c.idle_restore_secs, 30);
+        assert!(c.excluded_players.is_empty());
+    }
+
+    #[test]
+    fn parses_excluded_players_list() {
+        let c = parse(
+            r#"
+            pixoo_ip = "10.0.0.5"
+            excluded_players = ["chromium", "firefox"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.excluded_players, vec!["chromium", "firefox"]);
     }
 
     #[test]

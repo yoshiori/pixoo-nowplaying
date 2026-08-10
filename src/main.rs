@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 
 use state::{Action, Tracker};
 
-const PLAYERCTL_FORMAT: &str = "{{status}}\t{{mpris:artUrl}}";
+const PLAYERCTL_FORMAT: &str = "{{playerName}}\t{{status}}\t{{mpris:artUrl}}";
 const RESPAWN_DELAY: Duration = Duration::from_secs(2);
 const TICK_INTERVAL: Duration = Duration::from_secs(1);
 const FALLBACK_CHANNEL: u8 = 1;
@@ -49,12 +49,14 @@ fn main() -> Result<()> {
         match rx.recv_timeout(TICK_INTERVAL) {
             Ok(line) => {
                 println!("recv: {line:?}");
-                tracker.observe(metadata::parse_line(&line).as_ref(), Instant::now());
+                let np = metadata::parse_line_excluding(&line, &config.excluded_players);
+                tracker.observe(np.as_ref(), Instant::now());
                 // Drain the backlog so a slow HTTP action doesn't make us
                 // draw artwork for tracks the user has already skipped past.
                 while let Ok(line) = rx.try_recv() {
                     println!("recv: {line:?}");
-                    tracker.observe(metadata::parse_line(&line).as_ref(), Instant::now());
+                    let np = metadata::parse_line_excluding(&line, &config.excluded_players);
+                    tracker.observe(np.as_ref(), Instant::now());
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
