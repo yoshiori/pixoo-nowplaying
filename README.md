@@ -29,10 +29,12 @@ idle_restore_secs = 30  # how long playback must be stopped before restoring
 # restore_channel = 1   # unset: restore to whatever channel was showing
                         # when artwork took over (Channel/GetIndex)
 # excluded_players = ["chromium", "firefox"]
-                        # never show artwork from these players (e.g. YouTube
-                        # thumbnails from a browser). Matched against
-                        # playerctl's {{playerName}}, case-insensitive,
-                        # ".instanceNNN" suffixes included
+                        # players the daemon never follows (e.g. YouTube
+                        # thumbnails from a browser). Passed to playerctl as
+                        # --ignore-player, so other players keep working while
+                        # an excluded one is active. Use names as reported by
+                        # `playerctl -l`; a base name also covers its
+                        # ".instanceNNN" variants
 ```
 
 ## Run
