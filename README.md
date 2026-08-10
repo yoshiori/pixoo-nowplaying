@@ -1,5 +1,7 @@
 # pixoo-nowplaying
 
+[![CI](https://github.com/yoshiori/pixoo-nowplaying/actions/workflows/ci.yml/badge.svg)](https://github.com/yoshiori/pixoo-nowplaying/actions/workflows/ci.yml)
+
 Show the currently playing track's artwork on a [Divoom Pixoo 64](https://divoom.com/products/pixoo-64).
 
 Listens to MPRIS (via `playerctl --follow`), so anything that shows up in your
