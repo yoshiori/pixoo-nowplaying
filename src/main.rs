@@ -1,7 +1,9 @@
 mod artwork;
 mod config;
+mod homepod;
 mod metadata;
 mod pixoo;
+mod source;
 mod state;
 
 use std::io::{BufRead, BufReader};
@@ -13,7 +15,12 @@ use anyhow::{Context, Result};
 
 use state::{Action, Tracker};
 
-use metadata::PLAYERCTL_FORMAT;
+use metadata::{NowPlaying, PLAYERCTL_FORMAT};
+use source::{Arbiter, SourceId};
+
+/// What the reader threads report: a source and its latest state, where None
+/// means that source has no player at all.
+type Event = (SourceId, Option<NowPlaying>);
 
 const RESPAWN_DELAY: Duration = Duration::from_secs(2);
 const TICK_INTERVAL: Duration = Duration::from_secs(1);
@@ -44,21 +51,32 @@ fn main() -> Result<()> {
     let client = pixoo::Client::new(&config.pixoo_ip);
     let mut tracker = Tracker::new(Duration::from_secs(config.idle_restore_secs));
     let mut restore = RestoreTarget::new(config.restore_channel);
+    let mut arbiter = Arbiter::new();
 
-    let rx = spawn_playerctl_reader(&config.excluded_players)?;
+    let (tx, rx) = mpsc::channel();
+    spawn_playerctl_reader(&config.excluded_players, tx.clone())?;
+    if let Some(homepod) = config.homepod.clone() {
+        println!("also following HomePod {}", homepod.identifier);
+        homepod::spawn_reader(homepod, tx.clone())?;
+    }
+    // Leave the senders to the reader threads, so a Disconnected below really
+    // does mean every source is gone.
+    drop(tx);
+
     loop {
         match rx.recv_timeout(TICK_INTERVAL) {
-            Ok(line) => {
+            Ok(event) => {
                 // Drain the backlog so a slow HTTP action doesn't make us
                 // draw artwork for tracks the user has already skipped past.
-                for line in std::iter::once(line).chain(rx.try_iter()) {
-                    println!("recv: {line:?}");
-                    tracker.observe(metadata::parse_line(&line).as_ref(), Instant::now());
+                for (source, now_playing) in std::iter::once(event).chain(rx.try_iter()) {
+                    println!("recv: {source:?} {now_playing:?}");
+                    arbiter.observe(source, now_playing, Instant::now());
                 }
+                tracker.observe(arbiter.winner(), Instant::now());
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                anyhow::bail!("playerctl reader thread died")
+                anyhow::bail!("every now-playing reader thread died")
             }
         }
         if let Some(action) = tracker.decide(Instant::now()) {
@@ -134,14 +152,13 @@ fn playerctl_args(excluded: &[String]) -> Vec<String> {
     args
 }
 
-/// Streams `playerctl --follow` lines on a channel. An empty line means "no
+/// Streams local MPRIS state onto `tx`. An empty playerctl line means "no
 /// active player". playerctl exits when no player is around (version
 /// dependent), so keep respawning it — same strategy as the polybar script.
 /// stderr is inherited so playerctl's own errors reach the daemon's log.
-fn spawn_playerctl_reader(excluded: &[String]) -> Result<mpsc::Receiver<String>> {
+fn spawn_playerctl_reader(excluded: &[String], tx: mpsc::Sender<Event>) -> Result<()> {
     which_playerctl()?;
     let args = playerctl_args(excluded);
-    let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || loop {
         match Command::new("playerctl")
             .args(&args)
@@ -159,8 +176,9 @@ fn spawn_playerctl_reader(excluded: &[String]) -> Result<mpsc::Receiver<String>>
                         match reader.read_until(b'\n', &mut buf) {
                             Ok(0) => break,
                             Ok(_) => {
-                                let line = String::from_utf8_lossy(&buf).trim_end().to_string();
-                                if tx.send(line).is_err() {
+                                let line = String::from_utf8_lossy(&buf);
+                                let now_playing = metadata::parse_line(line.trim_end());
+                                if tx.send((SourceId::Local, now_playing)).is_err() {
                                     let _ = child.kill();
                                     let _ = child.wait();
                                     return;
@@ -181,12 +199,12 @@ fn spawn_playerctl_reader(excluded: &[String]) -> Result<mpsc::Receiver<String>>
             }
             Err(err) => eprintln!("failed to spawn playerctl: {err}"),
         }
-        if tx.send(String::new()).is_err() {
+        if tx.send((SourceId::Local, None)).is_err() {
             return;
         }
         std::thread::sleep(RESPAWN_DELAY);
     });
-    Ok(rx)
+    Ok(())
 }
 
 fn which_playerctl() -> Result<()> {

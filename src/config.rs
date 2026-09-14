@@ -19,6 +19,20 @@ pub struct Config {
     /// (a base name also covers its `.instanceNNN` variants).
     #[serde(default)]
     pub excluded_players: Vec<String>,
+    /// When set, a HomePod on the LAN is followed alongside local MPRIS.
+    #[serde(default)]
+    pub homepod: Option<HomePod>,
+}
+
+/// A HomePod to follow through pyatv.
+#[derive(Debug, Deserialize, PartialEq, Clone)]
+pub struct HomePod {
+    /// Device identifier as reported by `atvremote scan`.
+    pub identifier: String,
+    /// The device's IP. Optional: it only saves pyatv the mDNS discovery,
+    /// which is worth doing on hosts with many interfaces (VPNs, bridges).
+    #[serde(default)]
+    pub address: Option<String>,
 }
 
 fn default_idle_restore_secs() -> u64 {
@@ -44,6 +58,17 @@ pub fn parse(s: &str) -> Result<Config> {
             "excluded_players entries must be non-empty player names \
              without commas or whitespace (got {entry:?})"
         );
+    }
+    if let Some(homepod) = &mut config.homepod {
+        homepod.identifier = homepod.identifier.trim().to_string();
+        anyhow::ensure!(
+            !homepod.identifier.is_empty(),
+            "homepod.identifier must be a device identifier from `atvremote scan`"
+        );
+        if let Some(address) = &mut homepod.address {
+            *address = address.trim().to_string();
+            anyhow::ensure!(!address.is_empty(), "homepod.address must not be empty");
+        }
     }
     Ok(config)
 }
@@ -74,6 +99,47 @@ mod tests {
         assert_eq!(c.restore_channel, None);
         assert_eq!(c.idle_restore_secs, 30);
         assert!(c.excluded_players.is_empty());
+        assert_eq!(c.homepod, None);
+    }
+
+    #[test]
+    fn parses_homepod_section() {
+        let c = parse(
+            r#"
+            pixoo_ip = "10.0.0.5"
+
+            [homepod]
+            identifier = " 46:B5:0E:8C:4A:17 "
+            address = "192.168.0.141"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            c.homepod,
+            Some(HomePod {
+                identifier: "46:B5:0E:8C:4A:17".to_string(),
+                address: Some("192.168.0.141".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn homepod_address_is_optional() {
+        let c = parse("pixoo_ip = \"10.0.0.5\"\n[homepod]\nidentifier = \"abc\"").unwrap();
+        assert_eq!(c.homepod.unwrap().address, None);
+    }
+
+    #[test]
+    fn blank_homepod_identifier_is_an_error() {
+        let err = parse("pixoo_ip = \"10.0.0.5\"\n[homepod]\nidentifier = \"  \"").unwrap_err();
+        assert!(err.to_string().contains("homepod.identifier"));
+    }
+
+    #[test]
+    fn blank_homepod_address_is_an_error() {
+        let err = parse("pixoo_ip = \"10.0.0.5\"\n[homepod]\nidentifier = \"abc\"\naddress = \"\"")
+            .unwrap_err();
+        assert!(err.to_string().contains("homepod.address"));
     }
 
     #[test]
