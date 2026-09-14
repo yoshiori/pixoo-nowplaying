@@ -87,3 +87,8 @@ Or as a systemd user service:
 cp systemd/pixoo-nowplaying.service ~/.config/systemd/user/
 systemctl --user enable --now pixoo-nowplaying
 ```
+
+The unit sets its own `PATH`, because `systemd --user` does not inherit the
+one from your shell and would not find `atvscript` in `~/.local/bin`. Adjust
+it if your tools live somewhere else — `ExecStart` assumes the default
+`cargo install` root, so change that too if yours is `~/.local/bin`.
