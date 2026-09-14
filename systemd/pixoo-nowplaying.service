@@ -3,6 +3,10 @@ Description=Now-playing artwork on Divoom Pixoo 64
 After=graphical-session.target
 
 [Service]
+# systemd --user does not inherit the login shell's PATH, so pyatv's
+# atvscript and atvremote — installed into ~/.local/bin by uv or pipx —
+# would be invisible and the HomePod source would fail to start.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=%h/.cargo/bin/pixoo-nowplaying
 Restart=on-failure
 RestartSec=5
