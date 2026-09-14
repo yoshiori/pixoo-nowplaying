@@ -106,8 +106,12 @@ fn cache_dir() -> PathBuf {
 struct ArtworkCache {
     dir: PathBuf,
     device_args: Vec<String>,
-    /// The item hash currently on disk, and the URL it was published as.
-    current: Option<(String, String)>,
+    /// The last item asked about and the URL published for it — None when
+    /// that item turned out to have no artwork. Misses are remembered as
+    /// firmly as hits: the device pushes the same item repeatedly while it
+    /// plays, and a stream with no cover art would otherwise cost an
+    /// atvremote process on every push.
+    answer: Option<(String, Option<String>)>,
     seq: u64,
 }
 
@@ -116,7 +120,7 @@ impl ArtworkCache {
         Self {
             dir,
             device_args,
-            current: None,
+            answer: None,
             seq: 0,
         }
     }
@@ -124,24 +128,36 @@ impl ArtworkCache {
     /// URL for the item identified by `hash`, downloading it the first time
     /// that item is seen. None when the device has no artwork to give.
     fn url_for(&mut self, hash: &str) -> Option<String> {
-        if let Some((cached, url)) = &self.current {
-            if cached == hash {
-                return Some(url.clone());
+        self.url_for_with(hash, Self::fetch)
+    }
+
+    /// Forgets what the device answered, so the next ask is a real one. Used
+    /// after a reconnect: a miss caused by the connection dropping rather
+    /// than by the item itself deserves another try.
+    fn reset(&mut self) {
+        self.answer = None;
+    }
+
+    fn url_for_with<F>(&mut self, hash: &str, fetch: F) -> Option<String>
+    where
+        F: FnOnce(&mut Self) -> Result<String>,
+    {
+        if let Some((asked, url)) = &self.answer {
+            if asked == hash {
+                return url.clone();
             }
         }
-        self.current = None;
-        match self.fetch() {
-            Ok(url) => {
-                self.current = Some((hash.to_string(), url.clone()));
-                Some(url)
-            }
+        let url = match fetch(self) {
+            Ok(url) => Some(url),
             Err(err) => {
                 // Routine for AirPlay streams from third-party apps, which
                 // the HomePod plays without exposing any cover art.
                 eprintln!("no artwork for the HomePod's current item: {err:#}");
                 None
             }
-        }
+        };
+        self.answer = Some((hash.to_string(), url.clone()));
+        url
     }
 
     fn fetch(&mut self) -> Result<String> {
@@ -212,6 +228,7 @@ pub fn spawn_reader(cfg: HomePod, tx: Sender<(SourceId, Option<NowPlaying>)>) ->
         let mut artwork = ArtworkCache::new(cache_dir(), args.clone());
         loop {
             follow(&args, &mut artwork, &tx);
+            artwork.reset();
             // The device is gone as far as we know; say so before backing off.
             if tx.send((SourceId::HomePod, None)).is_err() {
                 return;
@@ -380,6 +397,80 @@ mod tests {
         );
         assert_eq!(parse_line("not json"), None);
         assert_eq!(parse_line(""), None);
+    }
+
+    fn cache() -> ArtworkCache {
+        ArtworkCache::new(PathBuf::from("/nonexistent"), Vec::new())
+    }
+
+    #[test]
+    fn an_item_is_only_asked_about_once() {
+        let mut cache = cache();
+        let asks = std::cell::Cell::new(0);
+        let url = |cache: &mut ArtworkCache, hash: &str, answer: &str| {
+            let answer = answer.to_string();
+            cache.url_for_with(hash, |_| {
+                asks.set(asks.get() + 1);
+                Ok(answer)
+            })
+        };
+        assert_eq!(
+            url(&mut cache, "one", "file:///a.png").as_deref(),
+            Some("file:///a.png")
+        );
+        // The device pushes the same item again while it plays.
+        assert_eq!(
+            url(&mut cache, "one", "file:///b.png").as_deref(),
+            Some("file:///a.png")
+        );
+        assert_eq!(asks.get(), 1);
+        assert_eq!(
+            url(&mut cache, "two", "file:///c.png").as_deref(),
+            Some("file:///c.png")
+        );
+        assert_eq!(asks.get(), 2);
+    }
+
+    #[test]
+    fn an_item_with_no_artwork_is_not_asked_about_again() {
+        // The expensive case: an AirPlay stream with no cover art pushes the
+        // same item for the length of the track.
+        let mut cache = cache();
+        let asks = std::cell::Cell::new(0);
+        let miss = |cache: &mut ArtworkCache| {
+            cache.url_for_with("silent", |_| {
+                asks.set(asks.get() + 1);
+                anyhow::bail!("no artwork")
+            })
+        };
+        assert_eq!(miss(&mut cache), None);
+        assert_eq!(miss(&mut cache), None);
+        assert_eq!(asks.get(), 1);
+    }
+
+    #[test]
+    fn a_reconnect_makes_the_next_ask_real_again() {
+        // A miss caused by the connection dropping must not outlive it.
+        let mut cache = cache();
+        let asks = std::cell::Cell::new(0);
+        assert_eq!(
+            cache.url_for_with("one", |_| {
+                asks.set(asks.get() + 1);
+                anyhow::bail!("connection lost")
+            }),
+            None
+        );
+        cache.reset();
+        assert_eq!(
+            cache
+                .url_for_with("one", |_| {
+                    asks.set(asks.get() + 1);
+                    Ok("file:///a.png".to_string())
+                })
+                .as_deref(),
+            Some("file:///a.png")
+        );
+        assert_eq!(asks.get(), 2);
     }
 
     #[test]
