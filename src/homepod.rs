@@ -136,7 +136,9 @@ impl ArtworkCache {
                 Some(url)
             }
             Err(err) => {
-                eprintln!("failed: fetching HomePod artwork: {err:#}");
+                // Routine for AirPlay streams from third-party apps, which
+                // the HomePod plays without exposing any cover art.
+                eprintln!("no artwork for the HomePod's current item: {err:#}");
                 None
             }
         }
@@ -155,11 +157,12 @@ impl ArtworkCache {
             .stdout(Stdio::null())
             .status()
             .with_context(|| format!("failed to run {REMOTE_BIN}"))?;
-        anyhow::ensure!(status.success(), "{REMOTE_BIN} artwork_save: {status}");
         anyhow::ensure!(
-            written.is_file(),
-            "{REMOTE_BIN} artwork_save wrote no file — no artwork for this item"
+            status.success(),
+            "{REMOTE_BIN} artwork_save failed ({status}) — the device exposes \
+             no artwork for this item"
         );
+        ensure_usable(&written)?;
         // Publish under a fresh name every time: the drawing code decides what
         // to redraw by comparing URLs, so a single reused filename would make
         // every track look like the one already on screen.
@@ -174,6 +177,20 @@ impl ArtworkCache {
             .map(String::from)
             .map_err(|()| anyhow::anyhow!("artwork path is not a valid URL: {}", path.display()))
     }
+}
+
+/// Rejects what `atvremote artwork_save` leaves behind when the device has no
+/// artwork to give: it can exit successfully having written an empty file,
+/// and publishing that as a picture makes the drawing code retry a file it
+/// can never decode.
+fn ensure_usable(path: &std::path::Path) -> Result<()> {
+    let size = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    anyhow::ensure!(
+        size > 0,
+        "{REMOTE_BIN} artwork_save produced no image — the device exposes \
+         no artwork for this item"
+    );
+    Ok(())
 }
 
 /// Streams the HomePod's state onto `tx` until the process ends, then keeps
@@ -363,6 +380,24 @@ mod tests {
         );
         assert_eq!(parse_line("not json"), None);
         assert_eq!(parse_line(""), None);
+    }
+
+    #[test]
+    fn an_empty_artwork_file_is_not_artwork() {
+        // atvremote exits 0 after writing 0 bytes when the HomePod is playing
+        // an AirPlay stream from a third-party app (pyatv#2891); publishing
+        // that file left the daemon retrying an undecodable image forever.
+        let dir = std::env::temp_dir().join("pixoo-nowplaying-homepod-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let empty = dir.join("empty.png");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(ensure_usable(&empty).is_err());
+        let real = dir.join("real.png");
+        std::fs::write(&real, b"\x89PNG").unwrap();
+        assert!(ensure_usable(&real).is_ok());
+        assert!(ensure_usable(&dir.join("missing.png")).is_err());
+        std::fs::remove_file(&empty).unwrap();
+        std::fs::remove_file(&real).unwrap();
     }
 
     #[test]
