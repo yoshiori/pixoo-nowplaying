@@ -64,11 +64,14 @@ pub fn parse_line(line: &str) -> Option<Update> {
         return Some(Update::Gone);
     }
     let status = match parsed.device_state.as_deref()? {
-        // Seeking and loading are on their way to playing; treating them as
-        // Playing keeps the artwork up during a scrub instead of starting an
-        // idle countdown.
-        "playing" | "seeking" | "loading" => PlayStatus::Playing,
-        "paused" => PlayStatus::Paused,
+        // Treating a scrub as Playing keeps the artwork up instead of
+        // starting an idle countdown.
+        "playing" | "seeking" => PlayStatus::Playing,
+        // A HomePod can sit in "loading" indefinitely after an AirPlay sender
+        // goes away, so it must not count as Playing or the idle restore
+        // never fires. As Paused, the artwork stays up through the grace
+        // period, so a normal load that turns into "playing" never flickers.
+        "paused" | "loading" => PlayStatus::Paused,
         "stopped" | "idle" => PlayStatus::Stopped,
         _ => return None,
     };
@@ -325,8 +328,8 @@ mod tests {
     }
 
     #[test]
-    fn maps_transient_states_to_playing() {
-        for device_state in ["playing", "seeking", "loading"] {
+    fn maps_playing_and_seeking_to_playing() {
+        for device_state in ["playing", "seeking"] {
             let line = format!(r#"{{"result": "success", "device_state": "{device_state}"}}"#);
             assert!(
                 matches!(
@@ -339,6 +342,17 @@ mod tests {
                 "{device_state}"
             );
         }
+    }
+
+    #[test]
+    fn maps_loading_to_paused_so_a_stuck_load_still_restores() {
+        assert!(matches!(
+            state(r#"{"result": "success", "device_state": "loading", "hash": "x"}"#),
+            Update::State {
+                status: PlayStatus::Paused,
+                ..
+            }
+        ));
     }
 
     #[test]
