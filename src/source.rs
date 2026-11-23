@@ -22,7 +22,10 @@ struct Slot {
 
 /// Picks which source the Pixoo follows when more than one can play at once.
 ///
-/// The winner is whichever source started playing most recently, and it keeps
+/// A playing source with artwork always beats one without: there is nothing
+/// to draw for an artless one, and some players (Spotify's in-app video, an
+/// AirPlay stream on a HomePod) never carry artwork. Among sources that tie
+/// on that, the winner is whichever started playing most recently, and it keeps
 /// the screen for as long as it plays — a track change does not restart its
 /// claim, so skipping tracks locally never hands the screen to a HomePod that
 /// has been playing all along. When nothing is playing anywhere the last
@@ -81,16 +84,18 @@ impl Arbiter {
             .retain(|s| s.state.is_some() || Some(&s.source) == winner.as_ref());
     }
 
-    /// The playing source that started most recently. Ties keep the earlier
-    /// slot.
+    /// The playing source to follow: one with artwork first, then the one
+    /// that started most recently. Ties keep the earlier slot.
     fn latest_playing(&self) -> Option<SourceId> {
-        let mut best: Option<(&SourceId, Instant)> = None;
+        let mut best: Option<(&SourceId, (bool, Instant))> = None;
         for slot in &self.slots {
             let Some(started) = slot.playing_since else {
                 continue;
             };
-            if best.is_none_or(|(_, best_started)| started > best_started) {
-                best = Some((&slot.source, started));
+            let has_art = slot.state.as_ref().is_some_and(|np| np.art_url.is_some());
+            let rank = (has_art, started);
+            if best.is_none_or(|(_, best_rank)| rank > best_rank) {
+                best = Some((&slot.source, rank));
             }
         }
         best.map(|(source, _)| source.clone())
@@ -134,6 +139,69 @@ mod tests {
 
     fn local(instance: &str) -> SourceId {
         SourceId::Local(instance.to_string())
+    }
+
+    fn playing_artless() -> Option<NowPlaying> {
+        Some(NowPlaying {
+            status: PlayStatus::Playing,
+            art_url: None,
+        })
+    }
+
+    fn is_artless_playing(a: &Arbiter) -> bool {
+        a.winner() == playing_artless().as_ref()
+    }
+
+    #[test]
+    fn a_later_artless_player_does_not_take_the_screen() {
+        // Spotify's desktop app also exposes an artless chromium.instanceNNN
+        // player for its in-app video; it went Playing on 2026-11-23 and
+        // would otherwise win by starting later.
+        let mut a = Arbiter::new();
+        let now = Instant::now();
+        a.observe(local("spotify"), playing("track"), now);
+        a.observe(
+            local("chromium.instance452832"),
+            playing_artless(),
+            now + SEC,
+        );
+        assert_eq!(art(&a), Some("track"));
+    }
+
+    #[test]
+    fn an_artless_player_wins_once_the_one_with_art_stops() {
+        let mut a = Arbiter::new();
+        let now = Instant::now();
+        a.observe(local("chromium.instance1"), playing_artless(), now);
+        a.observe(local("spotify"), playing("track"), now + SEC);
+        a.observe(local("spotify"), paused(), now + SEC * 2);
+        assert!(is_artless_playing(&a));
+    }
+
+    #[test]
+    fn among_artless_players_the_later_one_wins() {
+        let mut a = Arbiter::new();
+        let now = Instant::now();
+        a.observe(local("radio"), playing_artless(), now);
+        a.observe(SourceId::HomePod, playing_artless(), now + SEC);
+        a.observe(local("radio"), paused(), now + SEC * 2);
+        assert!(is_artless_playing(&a));
+        a.observe(local("radio"), playing_artless(), now + SEC * 3);
+        a.observe(SourceId::HomePod, paused(), now + SEC * 4);
+        assert!(is_artless_playing(&a));
+    }
+
+    #[test]
+    fn artwork_arriving_late_takes_the_screen() {
+        // Spotify emits an artless Playing event at track start before the
+        // artUrl shows up; once it does, it must beat an artless player that
+        // started in between.
+        let mut a = Arbiter::new();
+        let now = Instant::now();
+        a.observe(local("spotify"), playing_artless(), now);
+        a.observe(local("chromium.instance1"), playing_artless(), now + SEC);
+        a.observe(local("spotify"), playing("track"), now + SEC * 2);
+        assert_eq!(art(&a), Some("track"));
     }
 
     #[test]
