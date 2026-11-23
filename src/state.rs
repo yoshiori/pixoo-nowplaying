@@ -274,10 +274,13 @@ mod tests {
 
     #[test]
     fn no_player_starts_idle_countdown() {
+        // Same timing as a pause: the Arbiter relies on this and reports
+        // "nothing playing" as None instead of the last paused state.
         let mut t = Tracker::new(IDLE);
         let now = Instant::now();
         play_and_draw(&mut t, "a", now);
         t.observe(None, now);
+        assert_eq!(t.decide(now + IDLE - SEC), None);
         assert_eq!(t.decide(now + IDLE), Some(Action::RestoreChannel));
     }
 

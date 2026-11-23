@@ -13,102 +13,65 @@ pub enum SourceId {
     HomePod,
 }
 
-struct Slot {
+/// A source that is currently playing.
+struct Claim {
     source: SourceId,
-    state: Option<NowPlaying>,
-    /// When this source last went from not-playing to playing.
-    playing_since: Option<Instant>,
+    state: NowPlaying,
+    /// When the source went from not-playing to playing. A track change
+    /// keeps it, so skipping tracks never steals the screen back.
+    since: Instant,
+}
+
+impl Claim {
+    /// Higher wins. There is nothing to draw for an artless source, and some
+    /// never carry artwork (Spotify's in-app video, an AirPlay stream on a
+    /// HomePod), so artwork comes first; then the one that started later.
+    fn rank(&self) -> (bool, Instant) {
+        (self.state.art_url.is_some(), self.since)
+    }
 }
 
 /// Picks which source the Pixoo follows when more than one can play at once.
-///
-/// A playing source with artwork always beats one without: there is nothing
-/// to draw for an artless one, and some players (Spotify's in-app video, an
-/// AirPlay stream on a HomePod) never carry artwork. Among sources that tie
-/// on that, the winner is whichever started playing most recently, and it keeps
-/// the screen for as long as it plays — a track change does not restart its
-/// claim, so skipping tracks locally never hands the screen to a HomePod that
-/// has been playing all along. When nothing is playing anywhere the last
-/// winner stays selected, so its pause or stop drives the idle countdown just
-/// like a single source would.
+/// Only playing sources are kept: the Tracker handles a pause and "no player"
+/// the same way, so nothing else needs remembering.
 pub struct Arbiter {
-    slots: Vec<Slot>,
-    winner: Option<SourceId>,
+    playing: Vec<Claim>,
 }
 
 impl Arbiter {
     pub fn new() -> Self {
         Self {
-            slots: Vec::new(),
-            winner: None,
+            playing: Vec::new(),
         }
     }
 
     pub fn observe(&mut self, source: SourceId, np: Option<NowPlaying>, now: Instant) {
-        let playing = matches!(
-            np,
-            Some(NowPlaying {
-                status: PlayStatus::Playing,
-                ..
-            })
-        );
-        let slot = match self.slots.iter().position(|s| s.source == source) {
-            Some(i) => &mut self.slots[i],
-            None => {
-                self.slots.push(Slot {
-                    source: source.clone(),
-                    state: None,
-                    playing_since: None,
+        let existing = self.playing.iter().position(|c| c.source == source);
+        match (np, existing) {
+            (Some(state), Some(i)) if state.status == PlayStatus::Playing => {
+                self.playing[i].state = state;
+            }
+            (Some(state), None) if state.status == PlayStatus::Playing => {
+                self.playing.push(Claim {
+                    source,
+                    state,
+                    since: now,
                 });
-                self.slots.last_mut().expect("just pushed")
             }
-        };
-        if playing {
-            // get_or_insert, not assign: staying in Playing across a track
-            // change must not refresh the claim.
-            slot.playing_since.get_or_insert(now);
-        } else {
-            slot.playing_since = None;
+            (_, Some(i)) => {
+                self.playing.remove(i);
+            }
+            (_, None) => {}
         }
-        slot.state = np;
-        if let Some(latest) = self.latest_playing() {
-            self.winner = Some(latest);
-        } else if self.winner.is_none() {
-            self.winner = Some(source);
-        }
-        // Players come and go (a browser gets a new instance name per
-        // launch); forget the ones that are gone unless the screen follows
-        // them.
-        let winner = &self.winner;
-        self.slots
-            .retain(|s| s.state.is_some() || Some(&s.source) == winner.as_ref());
     }
 
-    /// The playing source to follow: one with artwork first, then the one
-    /// that started most recently. Ties keep the earlier slot.
-    fn latest_playing(&self) -> Option<SourceId> {
-        let mut best: Option<(&SourceId, (bool, Instant))> = None;
-        for slot in &self.slots {
-            let Some(started) = slot.playing_since else {
-                continue;
-            };
-            let has_art = slot.state.as_ref().is_some_and(|np| np.art_url.is_some());
-            let rank = (has_art, started);
-            if best.is_none_or(|(_, best_rank)| rank > best_rank) {
-                best = Some((&slot.source, rank));
-            }
-        }
-        best.map(|(source, _)| source.clone())
-    }
-
-    /// The state to reconcile against, or None when the winning source has no
-    /// player at all.
+    /// The playing source to follow, or None when nothing is playing. Ties
+    /// keep the one that was observed first.
     pub fn winner(&self) -> Option<&NowPlaying> {
-        let winner = self.winner.as_ref()?;
-        self.slots
+        self.playing
             .iter()
-            .find(|s| &s.source == winner)
-            .and_then(|s| s.state.as_ref())
+            .reduce(|best, c| if c.rank() > best.rank() { c } else { best })
+            .map(|c| &c.state)
     }
 }
 
@@ -242,7 +205,9 @@ mod tests {
     }
 
     #[test]
-    fn vanished_losers_are_forgotten() {
+    fn only_playing_sources_are_kept() {
+        // Browsers get a new instance name per launch; stopped ones must not
+        // pile up.
         let mut a = Arbiter::new();
         let now = Instant::now();
         a.observe(local("spotify"), playing("a"), now);
@@ -251,7 +216,7 @@ mod tests {
             a.observe(local(&tab), paused(), now + SEC);
             a.observe(local(&tab), None, now + SEC * 2);
         }
-        assert_eq!(a.slots.len(), 1);
+        assert_eq!(a.playing.len(), 1);
         assert_eq!(art(&a), Some("a"));
     }
 
@@ -267,8 +232,10 @@ mod tests {
         a.observe(local("spotify"), playing("a"), now);
         assert_eq!(art(&a), Some("a"));
         a.observe(local("spotify"), paused(), now + SEC);
-        assert_eq!(a.winner().map(|np| np.status), Some(PlayStatus::Paused));
-        a.observe(local("spotify"), None, now + SEC * 2);
+        assert_eq!(a.winner(), None);
+        a.observe(local("spotify"), playing("b"), now + SEC * 2);
+        assert_eq!(art(&a), Some("b"));
+        a.observe(local("spotify"), None, now + SEC * 3);
         assert_eq!(a.winner(), None);
     }
 
@@ -314,14 +281,15 @@ mod tests {
     }
 
     #[test]
-    fn the_last_winner_still_reports_when_nothing_plays() {
-        // Otherwise a pause would look like "no player at all" and the idle
-        // countdown would lose the state it reconciles against.
+    fn nothing_playing_reports_nothing() {
+        // The Tracker treats a pause and "no player" alike, so there is no
+        // need to remember who was paused last.
         let mut a = Arbiter::new();
         let now = Instant::now();
         a.observe(SourceId::HomePod, playing("homepod"), now);
-        a.observe(SourceId::HomePod, paused(), now + SEC);
-        assert_eq!(a.winner().map(|np| np.status), Some(PlayStatus::Paused));
+        a.observe(local("spotify"), paused(), now + SEC);
+        a.observe(SourceId::HomePod, paused(), now + SEC * 2);
+        assert_eq!(a.winner(), None);
     }
 
     #[test]
