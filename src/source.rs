@@ -3,23 +3,21 @@ use std::time::Instant;
 use crate::metadata::{NowPlaying, PlayStatus};
 
 /// Where a now-playing update came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceId {
-    /// MPRIS on this machine, via playerctl.
-    Local,
+    /// One MPRIS player on this machine, by its playerctl instance name.
+    /// Players are separate sources so that a paused one updating its
+    /// metadata cannot hide another one that is playing.
+    Local(String),
     /// A HomePod on the LAN, via pyatv.
     HomePod,
 }
 
-const SOURCE_COUNT: usize = 2;
-
-impl SourceId {
-    fn index(self) -> usize {
-        match self {
-            SourceId::Local => 0,
-            SourceId::HomePod => 1,
-        }
-    }
+struct Slot {
+    source: SourceId,
+    state: Option<NowPlaying>,
+    /// When this source last went from not-playing to playing.
+    playing_since: Option<Instant>,
 }
 
 /// Picks which source the Pixoo follows when more than one can play at once.
@@ -31,64 +29,81 @@ impl SourceId {
 /// winner stays selected, so its pause or stop drives the idle countdown just
 /// like a single source would.
 pub struct Arbiter {
-    states: [Option<NowPlaying>; SOURCE_COUNT],
-    /// When each source last went from not-playing to playing.
-    playing_since: [Option<Instant>; SOURCE_COUNT],
-    winner: usize,
+    slots: Vec<Slot>,
+    winner: Option<SourceId>,
 }
 
 impl Arbiter {
     pub fn new() -> Self {
         Self {
-            states: std::array::from_fn(|_| None),
-            playing_since: [None; SOURCE_COUNT],
-            winner: SourceId::Local.index(),
+            slots: Vec::new(),
+            winner: None,
         }
     }
 
     pub fn observe(&mut self, source: SourceId, np: Option<NowPlaying>, now: Instant) {
-        let i = source.index();
-        if matches!(
+        let playing = matches!(
             np,
             Some(NowPlaying {
                 status: PlayStatus::Playing,
                 ..
             })
-        ) {
+        );
+        let slot = match self.slots.iter().position(|s| s.source == source) {
+            Some(i) => &mut self.slots[i],
+            None => {
+                self.slots.push(Slot {
+                    source: source.clone(),
+                    state: None,
+                    playing_since: None,
+                });
+                self.slots.last_mut().expect("just pushed")
+            }
+        };
+        if playing {
             // get_or_insert, not assign: staying in Playing across a track
             // change must not refresh the claim.
-            self.playing_since[i].get_or_insert(now);
+            slot.playing_since.get_or_insert(now);
         } else {
-            self.playing_since[i] = None;
+            slot.playing_since = None;
         }
-        self.states[i] = np;
+        slot.state = np;
         if let Some(latest) = self.latest_playing() {
-            self.winner = latest;
+            self.winner = Some(latest);
+        } else if self.winner.is_none() {
+            self.winner = Some(source);
         }
+        // Players come and go (a browser gets a new instance name per
+        // launch); forget the ones that are gone unless the screen follows
+        // them.
+        let winner = &self.winner;
+        self.slots
+            .retain(|s| s.state.is_some() || Some(&s.source) == winner.as_ref());
     }
 
-    /// The playing source that started most recently. Ties keep the incumbent.
-    fn latest_playing(&self) -> Option<usize> {
-        let mut best: Option<(usize, Instant)> = None;
-        for i in 0..SOURCE_COUNT {
-            let Some(started) = self.playing_since[i] else {
+    /// The playing source that started most recently. Ties keep the earlier
+    /// slot.
+    fn latest_playing(&self) -> Option<SourceId> {
+        let mut best: Option<(&SourceId, Instant)> = None;
+        for slot in &self.slots {
+            let Some(started) = slot.playing_since else {
                 continue;
             };
-            let wins = match best {
-                None => true,
-                Some((_, best_started)) => started > best_started,
-            };
-            if wins {
-                best = Some((i, started));
+            if best.is_none_or(|(_, best_started)| started > best_started) {
+                best = Some((&slot.source, started));
             }
         }
-        best.map(|(i, _)| i)
+        best.map(|(source, _)| source.clone())
     }
 
     /// The state to reconcile against, or None when the winning source has no
     /// player at all.
     pub fn winner(&self) -> Option<&NowPlaying> {
-        self.states[self.winner].as_ref()
+        let winner = self.winner.as_ref()?;
+        self.slots
+            .iter()
+            .find(|s| &s.source == winner)
+            .and_then(|s| s.state.as_ref())
     }
 }
 
@@ -117,6 +132,61 @@ mod tests {
         a.winner().and_then(|np| np.art_url.as_deref())
     }
 
+    fn local(instance: &str) -> SourceId {
+        SourceId::Local(instance.to_string())
+    }
+
+    #[test]
+    fn a_paused_player_updating_does_not_hide_a_playing_one() {
+        // 2026-11-23: a paused Chromium tab mirroring Spotify refreshed its
+        // metadata right after every Spotify track change, and the artwork
+        // was handed back to the clock 30 s later.
+        let mut a = Arbiter::new();
+        let now = Instant::now();
+        a.observe(local("chromium.instance452832"), paused(), now);
+        a.observe(local("spotify"), playing("track-1"), now + SEC);
+        a.observe(local("spotify"), playing("track-2"), now + SEC * 2);
+        a.observe(local("chromium.instance452832"), paused(), now + SEC * 2);
+        assert_eq!(art(&a), Some("track-2"));
+    }
+
+    #[test]
+    fn the_local_player_that_started_later_wins() {
+        let mut a = Arbiter::new();
+        let now = Instant::now();
+        a.observe(local("spotify"), playing("spotify"), now);
+        a.observe(local("vlc"), playing("vlc"), now + SEC);
+        assert_eq!(art(&a), Some("vlc"));
+        a.observe(local("vlc"), paused(), now + SEC * 2);
+        assert_eq!(art(&a), Some("spotify"));
+    }
+
+    #[test]
+    fn a_winner_that_vanishes_reports_no_player() {
+        // The player quit while playing: nothing to follow any more, so the
+        // tracker can start its idle countdown.
+        let mut a = Arbiter::new();
+        let now = Instant::now();
+        a.observe(local("chromium.instance1"), paused(), now);
+        a.observe(local("spotify"), playing("a"), now + SEC);
+        a.observe(local("spotify"), None, now + SEC * 2);
+        assert_eq!(a.winner(), None);
+    }
+
+    #[test]
+    fn vanished_losers_are_forgotten() {
+        let mut a = Arbiter::new();
+        let now = Instant::now();
+        a.observe(local("spotify"), playing("a"), now);
+        for i in 0..10 {
+            let tab = format!("chromium.instance{i}");
+            a.observe(local(&tab), paused(), now + SEC);
+            a.observe(local(&tab), None, now + SEC * 2);
+        }
+        assert_eq!(a.slots.len(), 1);
+        assert_eq!(art(&a), Some("a"));
+    }
+
     #[test]
     fn reports_nothing_before_any_update() {
         assert_eq!(Arbiter::new().winner(), None);
@@ -126,11 +196,11 @@ mod tests {
     fn single_source_passes_its_state_through() {
         let mut a = Arbiter::new();
         let now = Instant::now();
-        a.observe(SourceId::Local, playing("a"), now);
+        a.observe(local("spotify"), playing("a"), now);
         assert_eq!(art(&a), Some("a"));
-        a.observe(SourceId::Local, paused(), now + SEC);
+        a.observe(local("spotify"), paused(), now + SEC);
         assert_eq!(a.winner().map(|np| np.status), Some(PlayStatus::Paused));
-        a.observe(SourceId::Local, None, now + SEC * 2);
+        a.observe(local("spotify"), None, now + SEC * 2);
         assert_eq!(a.winner(), None);
     }
 
@@ -140,7 +210,7 @@ mod tests {
         let now = Instant::now();
         a.observe(SourceId::HomePod, playing("homepod"), now);
         assert_eq!(art(&a), Some("homepod"));
-        a.observe(SourceId::Local, playing("local"), now + SEC);
+        a.observe(local("spotify"), playing("local"), now + SEC);
         assert_eq!(art(&a), Some("local"));
     }
 
@@ -149,7 +219,7 @@ mod tests {
         let mut a = Arbiter::new();
         let now = Instant::now();
         a.observe(SourceId::HomePod, playing("homepod-1"), now);
-        a.observe(SourceId::Local, playing("local"), now + SEC);
+        a.observe(local("spotify"), playing("local"), now + SEC);
         // The HomePod moves to its next track: still the older claim.
         a.observe(SourceId::HomePod, playing("homepod-2"), now + SEC * 2);
         assert_eq!(art(&a), Some("local"));
@@ -160,8 +230,8 @@ mod tests {
         let mut a = Arbiter::new();
         let now = Instant::now();
         a.observe(SourceId::HomePod, playing("homepod"), now);
-        a.observe(SourceId::Local, playing("local"), now + SEC);
-        a.observe(SourceId::Local, paused(), now + SEC * 2);
+        a.observe(local("spotify"), playing("local"), now + SEC);
+        a.observe(local("spotify"), paused(), now + SEC * 2);
         assert_eq!(art(&a), Some("homepod"));
     }
 
@@ -170,7 +240,7 @@ mod tests {
         let mut a = Arbiter::new();
         let now = Instant::now();
         a.observe(SourceId::HomePod, playing("homepod"), now);
-        a.observe(SourceId::Local, playing("local"), now + SEC);
+        a.observe(local("spotify"), playing("local"), now + SEC);
         a.observe(SourceId::HomePod, None, now + SEC * 2);
         assert_eq!(art(&a), Some("local"));
     }
@@ -191,7 +261,7 @@ mod tests {
         let mut a = Arbiter::new();
         let now = Instant::now();
         a.observe(SourceId::HomePod, playing("homepod"), now);
-        a.observe(SourceId::Local, playing("local"), now + SEC);
+        a.observe(local("spotify"), playing("local"), now + SEC);
         a.observe(SourceId::HomePod, paused(), now + SEC * 2);
         a.observe(SourceId::HomePod, playing("homepod"), now + SEC * 3);
         assert_eq!(art(&a), Some("homepod"));

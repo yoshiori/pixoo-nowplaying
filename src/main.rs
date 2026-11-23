@@ -6,6 +6,7 @@ mod pixoo;
 mod source;
 mod state;
 
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -15,7 +16,7 @@ use anyhow::{Context, Result};
 
 use state::{Action, Tracker};
 
-use metadata::{NowPlaying, PLAYERCTL_FORMAT};
+use metadata::{NowPlaying, PlayerState, PLAYERCTL_FORMAT};
 use source::{Arbiter, SourceId};
 
 /// What the reader threads report: a source and its latest state, where None
@@ -140,69 +141,163 @@ fn apply(
     }
 }
 
-/// Arguments for the `playerctl` subprocess. Excluded players are handed to
-/// playerctl itself via `--ignore-player`, so `--follow` falls through to the
-/// next player instead of going quiet while an excluded one is active.
-fn playerctl_args(excluded: &[String]) -> Vec<String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Long-running: one line whenever any player changes. Used only as a
+    /// trigger, because the line says nothing about the other players and
+    /// nothing at all when a player quits.
+    Follow,
+    /// One-shot: one line per player that is currently on the bus.
+    Snapshot,
+}
+
+/// Arguments for a `playerctl` subprocess. Excluded players are handed to
+/// playerctl itself via `--ignore-player`, so they never show up in either
+/// the trigger stream or the snapshots.
+fn playerctl_args(excluded: &[String], mode: Mode) -> Vec<String> {
     let mut args = Vec::new();
     if !excluded.is_empty() {
         args.push(format!("--ignore-player={}", excluded.join(",")));
     }
-    args.extend(["--follow", "metadata", "--format", PLAYERCTL_FORMAT].map(String::from));
+    args.push("--all-players".to_string());
+    if mode == Mode::Follow {
+        args.push("--follow".to_string());
+    }
+    args.extend(["metadata", "--format", PLAYERCTL_FORMAT].map(String::from));
     args
 }
 
-/// Streams local MPRIS state onto `tx`. An empty playerctl line means "no
-/// active player". playerctl exits when no player is around (version
-/// dependent), so keep respawning it — same strategy as the polybar script.
-/// stderr is inherited so playerctl's own errors reach the daemon's log.
+/// What playerctl prints on stderr (with a failing exit) when no player is
+/// on the bus. That is a normal state, not an error.
+const NO_PLAYERS_MESSAGE: &str = "No players found";
+
+fn snapshot_from_output(success: bool, stdout: &str, stderr: &str) -> Result<Vec<PlayerState>> {
+    if !success && stdout.trim().is_empty() {
+        if stderr.contains(NO_PLAYERS_MESSAGE) {
+            return Ok(Vec::new());
+        }
+        anyhow::bail!(
+            "playerctl snapshot failed: {} (is the session D-Bus reachable?)",
+            stderr.trim()
+        );
+    }
+    Ok(metadata::parse_snapshot(stdout))
+}
+
+fn take_snapshot(args: &[String]) -> Result<Vec<PlayerState>> {
+    let output = Command::new("playerctl")
+        .args(args)
+        .output()
+        .context("running playerctl for a snapshot")?;
+    snapshot_from_output(
+        output.status.success(),
+        &String::from_utf8_lossy(&output.stdout),
+        &String::from_utf8_lossy(&output.stderr),
+    )
+}
+
+/// Turns a fresh snapshot into events: one for each player whose state
+/// changed (or that is new), and None for each known player that is gone.
+fn diff_snapshot(
+    known: &mut HashMap<String, NowPlaying>,
+    snapshot: Vec<PlayerState>,
+) -> Vec<Event> {
+    let present: HashSet<&str> = snapshot.iter().map(|(name, _)| name.as_str()).collect();
+    let mut gone: Vec<String> = known
+        .keys()
+        .filter(|name| !present.contains(name.as_str()))
+        .cloned()
+        .collect();
+    gone.sort();
+    let mut events = Vec::new();
+    for (name, now_playing) in snapshot {
+        if known.get(&name) != Some(&now_playing) {
+            known.insert(name.clone(), now_playing.clone());
+            events.push((SourceId::Local(name), Some(now_playing)));
+        }
+    }
+    for name in gone {
+        known.remove(&name);
+        events.push((SourceId::Local(name), None));
+    }
+    events
+}
+
+/// Reports every known player as gone, e.g. when playerctl itself died and
+/// nothing about the bus can be trusted any more.
+fn forget_all(known: &mut HashMap<String, NowPlaying>) -> Vec<Event> {
+    let mut names: Vec<String> = known.drain().map(|(name, _)| name).collect();
+    names.sort();
+    names
+        .into_iter()
+        .map(|name| (SourceId::Local(name), None))
+        .collect()
+}
+
+/// Streams local MPRIS state onto `tx`, one source per player. Each line from
+/// `playerctl --follow` triggers a snapshot of all players, so a paused
+/// player refreshing its metadata can't mask one that is playing.
+/// playerctl exits when no player is around (version dependent), so keep
+/// respawning it — same strategy as the polybar script. stderr is inherited
+/// so playerctl's own errors reach the daemon's log.
 fn spawn_playerctl_reader(excluded: &[String], tx: mpsc::Sender<Event>) -> Result<()> {
     which_playerctl()?;
-    let args = playerctl_args(excluded);
-    std::thread::spawn(move || loop {
-        match Command::new("playerctl")
-            .args(&args)
-            .stdout(Stdio::piped())
-            .spawn()
-        {
-            Ok(mut child) => {
-                if let Some(stdout) = child.stdout.take() {
-                    let mut reader = BufReader::new(stdout);
-                    let mut buf = Vec::new();
-                    loop {
-                        buf.clear();
-                        // read_until + lossy conversion: a non-UTF-8 byte in
-                        // a metadata line must not kill the stream.
-                        match reader.read_until(b'\n', &mut buf) {
-                            Ok(0) => break,
-                            Ok(_) => {
-                                let line = String::from_utf8_lossy(&buf);
-                                let now_playing = metadata::parse_line(line.trim_end());
-                                if tx.send((SourceId::Local, now_playing)).is_err() {
-                                    let _ = child.kill();
-                                    let _ = child.wait();
-                                    return;
+    let follow_args = playerctl_args(excluded, Mode::Follow);
+    let snapshot_args = playerctl_args(excluded, Mode::Snapshot);
+    std::thread::spawn(move || {
+        let mut known = HashMap::new();
+        let send_all = |events: Vec<Event>| events.into_iter().all(|e| tx.send(e).is_ok());
+        loop {
+            match Command::new("playerctl")
+                .args(&follow_args)
+                .stdout(Stdio::piped())
+                .spawn()
+            {
+                Ok(mut child) => {
+                    if let Some(stdout) = child.stdout.take() {
+                        let mut reader = BufReader::new(stdout);
+                        let mut buf = Vec::new();
+                        loop {
+                            buf.clear();
+                            // Only the arrival of a line matters, so its
+                            // bytes are never decoded.
+                            match reader.read_until(b'\n', &mut buf) {
+                                Ok(0) => break,
+                                Ok(_) => {
+                                    let events = match take_snapshot(&snapshot_args) {
+                                        Ok(snapshot) => diff_snapshot(&mut known, snapshot),
+                                        Err(err) => {
+                                            eprintln!("failed: {err:#}");
+                                            continue;
+                                        }
+                                    };
+                                    if !send_all(events) {
+                                        let _ = child.kill();
+                                        let _ = child.wait();
+                                        return;
+                                    }
+                                }
+                                Err(err) => {
+                                    eprintln!("playerctl read error: {err}");
+                                    break;
                                 }
                             }
-                            Err(err) => {
-                                eprintln!("playerctl read error: {err}");
-                                break;
-                            }
                         }
+                        // Kill before wait: on a read error the child may
+                        // still be alive, and wait() on a live --follow blocks
+                        // forever.
+                        let _ = child.kill();
                     }
-                    // Kill before wait: on a read error the child may still
-                    // be alive, and wait() on a live --follow blocks forever.
-                    let _ = child.kill();
+                    let _ = child.wait();
+                    eprintln!("playerctl exited; respawning in {RESPAWN_DELAY:?}");
                 }
-                let _ = child.wait();
-                eprintln!("playerctl exited; respawning in {RESPAWN_DELAY:?}");
+                Err(err) => eprintln!("failed to spawn playerctl: {err}"),
             }
-            Err(err) => eprintln!("failed to spawn playerctl: {err}"),
+            if !send_all(forget_all(&mut known)) {
+                return;
+            }
+            std::thread::sleep(RESPAWN_DELAY);
         }
-        if tx.send((SourceId::Local, None)).is_err() {
-            return;
-        }
-        std::thread::sleep(RESPAWN_DELAY);
     });
     Ok(())
 }
@@ -220,6 +315,7 @@ fn which_playerctl() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use metadata::PlayStatus;
 
     #[test]
     fn configured_restore_channel_wins_over_captured() {
@@ -237,10 +333,24 @@ mod tests {
     }
 
     #[test]
-    fn playerctl_args_without_exclusions() {
+    fn follow_args_watch_every_player() {
         assert_eq!(
-            playerctl_args(&[]),
-            vec!["--follow", "metadata", "--format", PLAYERCTL_FORMAT]
+            playerctl_args(&[], Mode::Follow),
+            vec![
+                "--all-players",
+                "--follow",
+                "metadata",
+                "--format",
+                PLAYERCTL_FORMAT
+            ]
+        );
+    }
+
+    #[test]
+    fn snapshot_args_do_not_follow() {
+        assert_eq!(
+            playerctl_args(&[], Mode::Snapshot),
+            vec!["--all-players", "metadata", "--format", PLAYERCTL_FORMAT]
         );
     }
 
@@ -248,14 +358,127 @@ mod tests {
     fn playerctl_args_pass_exclusions_as_ignore_player() {
         let excluded = vec!["chromium".to_string(), "firefox".to_string()];
         assert_eq!(
-            playerctl_args(&excluded),
+            playerctl_args(&excluded, Mode::Snapshot),
             vec![
                 "--ignore-player=chromium,firefox",
-                "--follow",
+                "--all-players",
                 "metadata",
                 "--format",
                 PLAYERCTL_FORMAT,
             ]
+        );
+    }
+
+    fn state(instance: &str, status: PlayStatus, art: Option<&str>) -> PlayerState {
+        (
+            instance.to_string(),
+            NowPlaying {
+                status,
+                art_url: art.map(String::from),
+            },
+        )
+    }
+
+    fn local(instance: &str) -> SourceId {
+        SourceId::Local(instance.to_string())
+    }
+
+    #[test]
+    fn first_snapshot_reports_every_player() {
+        let mut known = HashMap::new();
+        let events = diff_snapshot(
+            &mut known,
+            vec![
+                state("chromium.instance1", PlayStatus::Paused, None),
+                state("spotify", PlayStatus::Playing, Some("a")),
+            ],
+        );
+        assert_eq!(
+            events,
+            vec![
+                (
+                    local("chromium.instance1"),
+                    Some(state("chromium.instance1", PlayStatus::Paused, None).1)
+                ),
+                (
+                    local("spotify"),
+                    Some(state("spotify", PlayStatus::Playing, Some("a")).1)
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn unchanged_players_are_not_reported_again() {
+        let mut known = HashMap::new();
+        let snapshot = vec![
+            state("chromium.instance1", PlayStatus::Paused, None),
+            state("spotify", PlayStatus::Playing, Some("a")),
+        ];
+        diff_snapshot(&mut known, snapshot);
+        let events = diff_snapshot(
+            &mut known,
+            vec![
+                state("chromium.instance1", PlayStatus::Paused, None),
+                state("spotify", PlayStatus::Playing, Some("b")),
+            ],
+        );
+        assert_eq!(
+            events,
+            vec![(
+                local("spotify"),
+                Some(state("spotify", PlayStatus::Playing, Some("b")).1)
+            )]
+        );
+    }
+
+    #[test]
+    fn a_player_missing_from_the_snapshot_is_reported_gone() {
+        // playerctl --follow prints nothing when a player quits, so the
+        // snapshot is the only place its disappearance shows up.
+        let mut known = HashMap::new();
+        diff_snapshot(
+            &mut known,
+            vec![
+                state("vlc", PlayStatus::Playing, None),
+                state("spotify", PlayStatus::Paused, None),
+            ],
+        );
+        let events = diff_snapshot(&mut known, vec![state("spotify", PlayStatus::Paused, None)]);
+        assert_eq!(events, vec![(local("vlc"), None)]);
+        assert!(!known.contains_key("vlc"));
+    }
+
+    #[test]
+    fn forget_all_reports_every_known_player_gone() {
+        let mut known = HashMap::new();
+        diff_snapshot(
+            &mut known,
+            vec![state("spotify", PlayStatus::Playing, Some("a"))],
+        );
+        assert_eq!(forget_all(&mut known), vec![(local("spotify"), None)]);
+        assert!(known.is_empty());
+    }
+
+    #[test]
+    fn no_players_output_is_an_empty_snapshot() {
+        assert_eq!(
+            snapshot_from_output(false, "", "No players found\n").unwrap(),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn other_playerctl_failures_are_errors() {
+        let err = snapshot_from_output(false, "", "Could not connect to D-Bus\n").unwrap_err();
+        assert!(format!("{err:#}").contains("Could not connect to D-Bus"));
+    }
+
+    #[test]
+    fn successful_output_is_parsed() {
+        assert_eq!(
+            snapshot_from_output(true, "spotify\tPaused\t\n", "").unwrap(),
+            vec![state("spotify", PlayStatus::Paused, None)]
         );
     }
 }
