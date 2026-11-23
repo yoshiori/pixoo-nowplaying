@@ -9,6 +9,10 @@ desktop's media controls — Spotify, browser playback, mpv — gets its album a
 rendered on the Pixoo. When playback stops, the Pixoo is returned to its
 regular channel (clock, weather, ...).
 
+Every local player is tracked on its own, with the same rule as the HomePod
+below: the one that started playing most recently owns the screen, so a
+paused browser tab refreshing its metadata never hides a playing Spotify.
+
 It can also follow a HomePod on the same network, so music started from a
 phone or by Siri shows up too. When both are playing, the one that started
 more recently owns the screen.
